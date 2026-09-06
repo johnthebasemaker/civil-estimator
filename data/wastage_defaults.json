@@ -1,0 +1,9 @@
+{
+  "concrete_pct": 3.0,
+  "rebar_pct": 5.0,
+  "formwork_pct": 10.0,
+  "hdpe_liner_pct": 8.0,
+  "epoxy_coating_pct": 15.0,
+  "pcc_pct": 5.0,
+  "compacted_soil_pct": 10.0
+}
