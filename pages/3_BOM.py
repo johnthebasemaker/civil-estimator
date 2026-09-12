@@ -1,5 +1,9 @@
 """BOM page — final preview and download."""
 from __future__ import annotations
+
+# Repair sys.path before anything heavy is imported: `streamlit run Home.py`
+# uses the framework Python, which has no PyMuPDF. See sitepath.py.
+import sitepath  # noqa: F401  (import first — it fixes the import path)
 from datetime import datetime
 from pathlib import Path
 import streamlit as st
@@ -8,16 +12,23 @@ from core.models import Project
 from core.bom_builder import build_bom
 from core.excel_writer import write_workbook
 from core.filename import build_output_path
+from ui import kit
 
-st.set_page_config(page_title="BOM — Civil Estimator", layout="wide")
+st.set_page_config(page_title="BOM — Civil Estimator", layout="wide",
+                   page_icon=kit.favicon())
+
+# Each page is its own script, so each carries the gate: a login on the
+# home page alone would be bypassed by navigating straight to a page URL.
+kit.require_login()
 
 if "project" not in st.session_state:
     st.session_state.project = Project(project_name="", drawing_no="")
 project: Project = st.session_state.project
 
-st.title("📊 BOM Preview & Download")
-st.caption(f"Project: **{project.project_name or '(unnamed)'}** | "
-           f"Drawing: `{project.drawing_no or '-'}` Rev `{project.revision or '-'}`")
+kit.page_header("BOM Preview & Download", project,
+                "The full bill of quantities, and the workbook.", step="BOM")
+_cov = kit.readiness_panel(project, compact=True)
+st.divider()
 
 # ---------- Guardrails ----------
 if not project.drawing_no:
@@ -98,10 +109,21 @@ st.subheader("Download Excel Workbook")
 target = build_output_path(project.drawing_no, "output")
 st.caption(f"Output filename: `{target.name}`")
 
+add_verify = st.checkbox(
+    "Add a Verification sheet (sign-off columns + drawing grid references)",
+    value=bool(st.session_state.get("extraction")),
+    help="Only meaningful when the quantities came from an extraction — it "
+         "lists each read value with its verbatim callout so a checker can "
+         "confirm it against the sheet.")
+
 if st.button("🧾 Generate Excel BOQ", type="primary", use_container_width=True):
     project.created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
     with st.spinner("Building workbook…"):
         written = write_workbook(project, bom, target)
+        _extraction = st.session_state.get("extraction")
+        if add_verify and _extraction is not None:
+            from extractors import workbook_extras as _WE
+            _WE.append_verification_sheet(written, _extraction)
     st.success(f"✅ Workbook written: `{written}`")
     with open(written, "rb") as f:
         st.download_button(
@@ -115,3 +137,6 @@ if st.button("🧾 Generate Excel BOQ", type="primary", use_container_width=True
 
 if st.session_state.get("last_output"):
     st.caption(f"Last generated: `{Path(st.session_state.last_output).name}`")
+
+kit.sidebar_summary(project)
+kit.sidebar_account()

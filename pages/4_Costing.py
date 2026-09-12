@@ -1,19 +1,36 @@
 """Costing page — rate entry + persistence + live total."""
 from __future__ import annotations
+
+# Repair sys.path before anything heavy is imported: `streamlit run Home.py`
+# uses the framework Python, which has no PyMuPDF. See sitepath.py.
+import sitepath  # noqa: F401  (import first — it fixes the import path)
 import streamlit as st
 import pandas as pd
 from core.models import Project
 from core.bom_builder import build_bom
 from core import rate_library
+from ui import kit
 
-st.set_page_config(page_title="Costing — Civil Estimator", layout="wide")
+st.set_page_config(page_title="Costing — Civil Estimator", layout="wide",
+                   page_icon=kit.favicon())
+
+# Each page is its own script, so each carries the gate: a login on the
+# home page alone would be bypassed by navigating straight to a page URL.
+kit.require_login()
 
 if "project" not in st.session_state:
     st.session_state.project = Project(project_name="", drawing_no="")
 project: Project = st.session_state.project
 
-st.title("💰 Costing")
-st.caption(f"Project: **{project.project_name or '(unnamed)'}** | Rates persist across projects in `data/rates.db`.")
+kit.page_header("Costing", project,
+                "Rates persist across projects in `data/rates.db`.",
+                step="Costing")
+_cov = kit.assess(project)
+if _cov.blockers:
+    for _b in _cov.blockers:
+        st.error(_b, icon="🚫")
+    st.caption("Pricing an estimate with these open is how a tender goes wrong. "
+               "Fix them on **Input** first.")
 
 # ---------- Build BOM ----------
 try:
@@ -90,3 +107,6 @@ with c2:
     st.dataframe(cat_df, hide_index=True, use_container_width=True)
 
 st.info("💡 The Excel workbook (from **3_BOM**) includes a Costing sheet with these rates baked in.")
+
+kit.sidebar_summary(project)
+kit.sidebar_account()

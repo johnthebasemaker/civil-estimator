@@ -1,0 +1,25 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "civil-estimator",
+      "runtimeExecutable": "/Users/johnsonandrew/Downloads/Python Projects/civil-estimator/venv/bin/python",
+      "runtimeArgs": [
+        "-m",
+        "streamlit",
+        "run",
+        "/Users/johnsonandrew/Downloads/Python Projects/civil-estimator/Home.py",
+        "--server.port",
+        "8502",
+        "--server.headless",
+        "true",
+        "--server.fileWatcherType",
+        "auto",
+        "--browser.gatherUsageStats",
+        "false"
+      ],
+      "port": 8502,
+      "cwd": "/Users/johnsonandrew/Downloads/Python Projects/civil-estimator"
+    }
+  ]
+}

@@ -1,18 +1,31 @@
 """Review page — read-only totals preview, wastage overrides, warnings."""
 from __future__ import annotations
+
+# Repair sys.path before anything heavy is imported: `streamlit run Home.py`
+# uses the framework Python, which has no PyMuPDF. See sitepath.py.
+import sitepath  # noqa: F401  (import first — it fixes the import path)
 import streamlit as st
 import pandas as pd
 from core.models import Project
 from core.bom_builder import build_bom
+from ui import kit
 
-st.set_page_config(page_title="Review — Civil Estimator", layout="wide")
+st.set_page_config(page_title="Review — Civil Estimator", layout="wide",
+                   page_icon=kit.favicon())
+
+# Each page is its own script, so each carries the gate: a login on the
+# home page alone would be bypassed by navigating straight to a page URL.
+kit.require_login()
 
 if "project" not in st.session_state:
     st.session_state.project = Project(project_name="", drawing_no="")
 project: Project = st.session_state.project
 
-st.title("🔍 Review & Wastage")
-st.caption(f"Project: **{project.project_name or '(unnamed)'}** | Drawing: `{project.drawing_no or '-'}`")
+kit.page_header("Review & Wastage", project,
+                "Check the totals and the wastage allowances before pricing.",
+                step="Review")
+kit.readiness_panel(project, compact=True)
+st.divider()
 
 # ---------- Wastage overrides ----------
 st.subheader("Wastage % (editable per run)")
@@ -95,3 +108,6 @@ if rollups:
     st.dataframe(ru_df, hide_index=True, use_container_width=True)
 
 st.info("Proceed to **3_BOM** (Step 6) to download the Excel workbook.")
+
+kit.sidebar_summary(project)
+kit.sidebar_account()
