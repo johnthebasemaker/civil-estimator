@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Civil Estimator — one command for the whole thing.
+#
+#   ./bin/ce              start both, follow the log, Ctrl-C stops both
+#   ./bin/ce start        same, but return to the prompt
+#   ./bin/ce stop         stop both
+#   ./bin/ce restart
+#   ./bin/ce status
+#   ./bin/ce logs         follow both logs
+#
+# The app and the worker are separate processes on purpose: the worker talks to
+# the model and the app must stay responsive while it does. That is an
+# implementation detail nobody should have to remember, so this script owns both
+# and never leaves one running without the other.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+RUN_DIR=.run
+LOG_DIR=output/logs
+APP_PID=$RUN_DIR/app.pid
+WORKER_PID=$RUN_DIR/worker.pid
+APP_LOG=$LOG_DIR/app.log
+WORKER_LOG=$LOG_DIR/worker.log
+PORT=${STREAMLIT_SERVER_PORT:-8501}
+
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+
+have()  { [ -f "$1" ] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
+pidof_() { cat "$1" 2>/dev/null; }
+
+check_venv() {
+  if [ ! -x venv/bin/streamlit ]; then
+    echo "venv/bin/streamlit not found. Build the environment first:" >&2
+    echo "  python3 -m venv venv && venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+  fi
+}
+
+start_one() {  # name pidfile logfile command...
+  local name=$1 pidfile=$2 logfile=$3; shift 3
+  if have "$pidfile"; then
+    echo "  $name already running (pid $(pidof_ "$pidfile"))"
+    return 0
+  fi
+  "$@" >>"$logfile" 2>&1 &
+  echo $! >"$pidfile"
+  echo "  $name started (pid $!) → $logfile"
+}
+
+stop_one() {  # name pidfile
+  local name=$1 pidfile=$2 pid
+  pid=$(pidof_ "$pidfile")
+  if [ -z "${pid:-}" ] || ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$pidfile"
+    echo "  $name not running"
+    return 0
+  fi
+  # SIGTERM, not SIGKILL. The worker finishes the drawing it is on; killing it
+  # mid-write throws away minutes of model time and leaves a half-built file.
+  kill -TERM "$pid" 2>/dev/null
+  for _ in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "  $name did not stop in 30s — forcing"
+    kill -KILL "$pid" 2>/dev/null
+  fi
+  rm -f "$pidfile"
+  echo "  $name stopped"
+}
+
+cmd_start() {
+  check_venv
+  if ! curl -s -m 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    echo "note: Ollama is not answering on :11434."
+    echo "      Drawings that kept their text layer still extract; the rest will"
+    echo "      fail until you run:  ollama serve"
+    echo
+  fi
+  echo "Starting Civil Estimator:"
+  start_one worker "$WORKER_PID" "$WORKER_LOG" venv/bin/python bin/worker.py
+  start_one app "$APP_PID" "$APP_LOG" venv/bin/streamlit run Home.py \
+    --server.port "$PORT" --server.headless true \
+    --browser.gatherUsageStats false
+  echo
+  echo "  http://localhost:$PORT"
+  echo "  ./bin/ce logs     follow both logs"
+  echo "  ./bin/ce stop     stop both"
+}
+
+cmd_stop() {
+  echo "Stopping Civil Estimator:"
+  stop_one app "$APP_PID"
+  stop_one worker "$WORKER_PID"
+}
+
+cmd_status() {
+  local rc=0
+  for pair in "app:$APP_PID" "worker:$WORKER_PID"; do
+    local name=${pair%%:*} file=${pair#*:}
+    if have "$file"; then
+      printf "  %-8s running (pid %s)\n" "$name" "$(pidof_ "$file")"
+    else
+      printf "  %-8s stopped\n" "$name"
+      rc=1
+    fi
+  done
+  if curl -s -m 2 http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+    echo "  ollama   reachable on :11434"
+  else
+    echo "  ollama   not reachable on :11434"
+  fi
+  venv/bin/python - <<'PY' 2>/dev/null || true
+from core import jobstore as JS
+s = JS.summary()
+c = s["counts"]
+print(f"  queue    {c['queued']} waiting, {c['running']} running, "
+      f"{c['done']} done, {c['failed']} failed")
+PY
+  return $rc
+}
+
+cmd_logs() { tail -n 40 -F "$APP_LOG" "$WORKER_LOG"; }
+
+case "${1:-run}" in
+  run)
+    cmd_start
+    # Ctrl-C here has to take both down, otherwise the worker is orphaned and
+    # the next start finds the port busy and the queue already claimed.
+    trap 'echo; cmd_stop; exit 0' INT TERM
+    echo
+    echo "Following logs. Ctrl-C stops both."
+    tail -n 0 -F "$APP_LOG" "$WORKER_LOG" &
+    TAIL_PID=$!
+    while have "$APP_PID"; do sleep 2; done
+    kill "$TAIL_PID" 2>/dev/null
+    cmd_stop
+    ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_stop; sleep 1; cmd_start ;;
+  status)  cmd_status ;;
+  logs)    cmd_logs ;;
+  *)
+    echo "usage: ./bin/ce [run|start|stop|restart|status|logs]" >&2
+    exit 2 ;;
+esac

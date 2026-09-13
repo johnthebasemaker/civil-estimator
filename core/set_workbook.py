@@ -59,6 +59,11 @@ ACTIVITIES: "OrderedDict[str, tuple[str, ...]]" = OrderedDict([
 ])
 
 
+# Which activity sheet a BOM category lands on. The Summary needs the reverse of
+# ACTIVITIES to know which sheet to reach into for a given row.
+CATEGORY_TO_ACTIVITY = {cat: act for act, cats in ACTIVITIES.items() for cat in cats}
+
+
 @dataclass
 class DrawingEntry:
     """One drawing's contribution to the set."""
@@ -239,6 +244,7 @@ def _write_summary(wb: Workbook, entries: list[DrawingEntry],
                 row["assumptions"].add(why)
 
     r = head + 2
+    first_item_row = r
     sl = 0
     for category in sorted({k[0] for k in rows}):
         c = ws.cell(row=r, column=1, value=category.upper())
@@ -254,10 +260,21 @@ def _write_summary(wb: Workbook, entries: list[DrawingEntry],
             ws.cell(row=r, column=1, value=sl).alignment = CENTER
             ws.cell(row=r, column=2, value=item).alignment = LEFT
             ws.cell(row=r, column=3, value=unit).alignment = CENTER
+            activity = CATEGORY_TO_ACTIVITY.get(category, "")
             for i, entry in enumerate(entries):
                 qty = data["qty"].get(entry.drawing_no)
+                # The quantity is not copied here; it is read from the drawing's
+                # own activity sheet. Correcting a line there — a net quantity, a
+                # wastage percentage — updates this cell and the set total with
+                # it, which is the whole point of keeping one workbook.
+                sheet = _sheet_name(codes[entry.drawing_no], activity) if activity else ""
+                formula = None
+                if qty and sheet:
+                    formula = _sumif(sheet, f"$B{r}", desc_col=DETAIL_DESC_COL,
+                                     value_col=DETAIL_GROSS_COL,
+                                     first=DETAIL_FIRST_ROW, last=DETAIL_LAST_ROW)
                 cell = ws.cell(row=r, column=4 + i,
-                               value=round(qty, 3) if qty else None)
+                               value=formula or (round(qty, 3) if qty else None))
                 cell.number_format = "#,##0.000"
                 cell.alignment = RIGHT
                 if qty and _assumption(entry, _Fake(key, entry)):
@@ -278,7 +295,8 @@ def _write_summary(wb: Workbook, entries: list[DrawingEntry],
                 ws.cell(row=r, column=col).border = BORDER
             r += 1
 
-    r, sl = _write_discovered_block(ws, entries, headers, r, sl)
+    r, sl = _write_spare_rows(ws, entries, codes, headers, r, sl, first_item_row)
+    r, sl = _write_discovered_block(ws, entries, codes, headers, r, sl)
 
     # Position marks, kept well away from the priced rows.
     if any(e.position_marks for e in entries):
@@ -329,6 +347,143 @@ def _write_summary(wb: Workbook, entries: list[DrawingEntry],
     ws.freeze_panes = ws.cell(row=head + 2, column=4)
 
 
+# Rows left blank on the Summary, pre-wired, so a line added on a detail sheet
+# has somewhere to land.
+SPARE_ROWS = 12
+
+
+def _activity_sheets(entry: DrawingEntry, code: str) -> list[str]:
+    """Every activity sheet this drawing actually has."""
+    out = []
+    for activity, categories in ACTIVITIES.items():
+        if any(l.category in categories for l in entry.bom.lines):
+            out.append(_sheet_name(code, activity))
+    return out
+
+
+def _write_spare_rows(ws, entries: list[DrawingEntry], codes: dict[str, str],
+                      headers: list[str], r: int, sl: int,
+                      first_item_row: int) -> tuple[int, int]:
+    """Blank rows that link themselves the moment you name them.
+
+    The one real limit of matching on a description is that a line your team
+    *adds* to a detail sheet has no Summary row to land in. Rather than leave
+    that as a footnote, the Summary carries spare rows whose formulas are
+    already written and which search every one of that drawing's activity
+    sheets. Type the description you used and the quantity appears.
+
+    The reconciliation row underneath makes the problem visible in the first
+    place: it counts, per drawing, the lines on that drawing's detail sheets
+    whose description appears nowhere on this Summary. Zero means nothing has
+    been missed. Anything else names exactly how many rows to fill in.
+    """
+    if not entries:
+        return r, sl
+    last_item_row = r - 1
+
+    r += 1
+    c = ws.cell(row=r, column=1, value="ADD YOUR OWN LINES HERE")
+    c.font = Font(bold=True, color="1F4E78")
+    for col in range(1, len(headers) + 1):
+        ws.cell(row=r, column=col).fill = GROUP_FILL
+        ws.cell(row=r, column=col).border = BORDER
+    r += 1
+    note = ws.cell(row=r, column=1, value=(
+        "Added a line to one of the detail sheets? Type its description in "
+        "column B here and its UoM in column C. The quantity columns are "
+        "already wired to search every activity sheet of each drawing, so the "
+        "number appears as soon as the description matches."))
+    note.alignment = LEFT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
+    r += 1
+
+    spare_first = r
+    for _ in range(SPARE_ROWS):
+        sl += 1
+        ws.cell(row=r, column=1, value=sl).alignment = CENTER
+        ws.cell(row=r, column=2).alignment = LEFT
+        ws.cell(row=r, column=3).alignment = CENTER
+        for i, entry in enumerate(entries):
+            sheets = _activity_sheets(entry, codes[entry.drawing_no])
+            items_sheet = _sheet_name(codes[entry.drawing_no], "Drawing items")
+            if entry.discovered:
+                sheets_formula = [
+                    _sumif(s, f"$B{r}", desc_col=DETAIL_DESC_COL,
+                           value_col=DETAIL_GROSS_COL, first=DETAIL_FIRST_ROW,
+                           last=DETAIL_LAST_ROW).lstrip("=") for s in sheets]
+                sheets_formula.append(
+                    _sumif(items_sheet, f"$B{r}", desc_col=ITEMS_DESC_COL,
+                           value_col=ITEMS_QTY_COL, first=ITEMS_FIRST_ROW,
+                           last=ITEMS_LAST_ROW).lstrip("="))
+            else:
+                sheets_formula = [
+                    _sumif(s, f"$B{r}", desc_col=DETAIL_DESC_COL,
+                           value_col=DETAIL_GROSS_COL, first=DETAIL_FIRST_ROW,
+                           last=DETAIL_LAST_ROW).lstrip("=") for s in sheets]
+            cell = ws.cell(row=r, column=4 + i,
+                           value=("=" + "+".join(sheets_formula)) if sheets_formula
+                           else None)
+            cell.number_format = "#,##0.000"
+            cell.alignment = RIGHT
+        first_col = get_column_letter(4)
+        last_col = get_column_letter(3 + len(entries))
+        total = ws.cell(row=r, column=4 + len(entries),
+                        value=f"=SUM({first_col}{r}:{last_col}{r})")
+        total.number_format = "#,##0.000"
+        total.alignment = RIGHT
+        total.fill = TOTAL_FILL
+        for col in range(1, len(headers) + 1):
+            ws.cell(row=r, column=col).border = BORDER
+        r += 1
+    spare_last = r - 1
+
+    # --- the check that makes a missed line visible -------------------------
+    r += 1
+    c = ws.cell(row=r, column=1, value="LINES ON A DETAIL SHEET WITH NO SUMMARY ROW")
+    c.font = Font(bold=True, color="C00000")
+    for col in range(1, len(headers) + 1):
+        ws.cell(row=r, column=col).fill = ASSUMED_FILL
+        ws.cell(row=r, column=col).border = BORDER
+    r += 1
+    note = ws.cell(row=r, column=1, value=(
+        "Counted live, per drawing. Zero means every line on that drawing's "
+        "detail sheets is represented above. Anything else is the number of "
+        "descriptions to copy into the spare rows."))
+    note.alignment = LEFT
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
+    r += 1
+
+    ws.cell(row=r, column=2, value="Unmatched detail lines").alignment = LEFT
+    ws.cell(row=r, column=3, value="count").alignment = CENTER
+    summary_range = (f"$B${first_item_row}:$B${last_item_row},"
+                     f"$B${spare_first}:$B${spare_last}")
+    for i, entry in enumerate(entries):
+        sheets = _activity_sheets(entry, codes[entry.drawing_no])
+        terms = []
+        for sheet in sheets:
+            ref = _quote(sheet)
+            rng = f"{ref}!${DETAIL_DESC_COL}${DETAIL_FIRST_ROW}:${DETAIL_DESC_COL}${DETAIL_LAST_ROW}"
+            # A row counts as unmatched when it has a description and that
+            # description appears in neither the priced rows above nor the
+            # spare rows. The subtotal block on each detail sheet deliberately
+            # leaves column B empty so it is never counted here.
+            terms.append(
+                f'SUMPRODUCT(({rng}<>"")*'
+                f"(COUNTIF($B${first_item_row}:$B${last_item_row},{rng})=0)*"
+                f"(COUNTIF($B${spare_first}:$B${spare_last},{rng})=0))")
+        cell = ws.cell(row=r, column=4 + i,
+                       value=("=" + "+".join(terms)) if terms else 0)
+        cell.alignment = RIGHT
+        cell.fill = ASSUMED_FILL
+    ws.cell(row=r, column=5 + len(entries), value=(
+        "0 is what you want. " + summary_range.replace("$", "")
+        + " are the descriptions it checks against.")).alignment = LEFT
+    for col in range(1, len(headers) + 1):
+        ws.cell(row=r, column=col).border = BORDER
+    r += 1
+    return r, sl
+
+
 def _discovered_key(row: dict) -> tuple[str, str]:
     return (str(row.get("description") or ""), str(row.get("uom") or ""))
 
@@ -366,7 +521,8 @@ def _double_count_warning(entry: DrawingEntry, item: dict) -> str:
     return ""
 
 
-def _write_discovered_block(ws, entries: list[DrawingEntry], headers: list[str],
+def _write_discovered_block(ws, entries: list[DrawingEntry],
+                            codes: dict[str, str], headers: list[str],
                             r: int, sl: int) -> tuple[int, int]:
     """Items the drawings specify that the priced rows above do not cover.
 
@@ -421,8 +577,20 @@ def _write_discovered_block(ws, entries: list[DrawingEntry], headers: list[str],
         ws.cell(row=r, column=2, value=description).alignment = LEFT
         ws.cell(row=r, column=3, value=uom).alignment = CENTER
         for i, entry in enumerate(entries):
-            qty = data["qty"].get(entry.drawing_no)
-            cell = ws.cell(row=r, column=4 + i, value=qty)
+            # Linked, not copied — and this is the block where it matters most.
+            # A row whose quantity is blank is the sheet stating a specification
+            # without an extent; the reviewer types the area on the drawing's own
+            # items sheet and it appears here.
+            has_sheet = bool(entry.discovered or entry.discovery.get("specifications")
+                             or entry.discovery.get("heights"))
+            sheet = (_sheet_name(codes[entry.drawing_no], "Drawing items")
+                     if has_sheet else "")
+            named_here = any(_discovered_key(it) == (description, uom)
+                             for it in entry.discovered)
+            cell = ws.cell(row=r, column=4 + i, value=(
+                _sumif(sheet, f"$B{r}", desc_col=ITEMS_DESC_COL,
+                       value_col=ITEMS_QTY_COL, first=ITEMS_FIRST_ROW,
+                       last=ITEMS_LAST_ROW) if (sheet and named_here) else None))
             cell.number_format = "#,##0.###"
             cell.alignment = RIGHT
             cell.fill = ASSUMED_FILL
@@ -582,6 +750,32 @@ def _write_discovered_sheet(wb: Workbook, entry: DrawingEntry, code: str) -> Non
     ws.freeze_panes = "A6"
 
 
+# Where the linked numbers live on an activity sheet. The Summary reaches into
+# these columns by SUMIF, so moving one means changing the formula too.
+DETAIL_FIRST_ROW = 5
+# Generous enough that rows appended by the reviewing engineer are still picked
+# up, and bounded so the formulas stay legible when someone opens the sheet.
+DETAIL_LAST_ROW = 800
+DETAIL_DESC_COL = "B"
+DETAIL_GROSS_COL = "F"
+ITEMS_DESC_COL = "B"
+ITEMS_QTY_COL = "D"
+ITEMS_FIRST_ROW = 6
+ITEMS_LAST_ROW = 400
+
+
+def _quote(sheet_name: str) -> str:
+    """A sheet reference Excel will accept. Names here carry spaces and hyphens."""
+    return "'" + sheet_name.replace("'", "''") + "'"
+
+
+def _sumif(sheet_name: str, key_cell: str, *, desc_col: str, value_col: str,
+           first: int, last: int) -> str:
+    ref = _quote(sheet_name)
+    return (f"=SUMIF({ref}!${desc_col}${first}:${desc_col}${last},{key_cell},"
+            f"{ref}!${value_col}${first}:${value_col}${last})")
+
+
 def _write_detail_sheets(wb: Workbook, entry: DrawingEntry, code: str) -> None:
     """One sheet per activity present on this drawing."""
     for activity, categories in ACTIVITIES.items():
@@ -603,7 +797,7 @@ def _write_detail_sheets(wb: Workbook, entry: DrawingEntry, code: str) -> None:
             r = 4 + i
             why = _assumption(entry, line)
             values = [i, line.item, line.unit, round(line.qty_net, 3),
-                      line.wastage_pct, round(line.qty_gross, 3),
+                      line.wastage_pct, None,
                       line.source_tag, why, line.notes]
             for col, value in enumerate(values, start=1):
                 c = ws.cell(row=r, column=col, value=value)
@@ -614,7 +808,114 @@ def _write_detail_sheets(wb: Workbook, entry: DrawingEntry, code: str) -> None:
                     c.number_format = "#,##0.000"
                 if why and col in (4, 6, 8):
                     c.fill = ASSUMED_FILL
+            # Gross is arithmetic, not a reading. Written as a formula so that
+            # correcting the net quantity or the wastage on this sheet is enough
+            # — the gross follows, and the Summary follows the gross.
+            ws.cell(row=r, column=6, value=f"=D{r}*(1+E{r}/100)")
+
+        last = 4 + len(lines)
+        _write_sheet_subtotals(ws, lines, first=DETAIL_FIRST_ROW, last=last)
         for col, width in {1: 7, 2: 44, 3: 7, 4: 12, 5: 11, 6: 13, 7: 12,
                            8: 40, 9: 34}.items():
             ws.column_dimensions[get_column_letter(col)].width = width
         ws.freeze_panes = "A5"
+
+
+def _write_sheet_subtotals(ws, lines, *, first: int, last: int) -> None:
+    """Per-unit totals for this sheet alone.
+
+    An activity sheet mixes units — concrete in m3 beside formwork in m2 — so a
+    single total at the foot would be a meaningless number that somebody would
+    eventually price. One subtotal per unit is the honest version, and each is a
+    SUMIF so it moves the moment a quantity above it is corrected.
+    """
+    units = []
+    for line in lines:
+        if line.unit not in units:
+            units.append(line.unit)
+    # Column B stays empty for the whole of this block, deliberately. The
+    # Summary counts non-empty descriptions in column B to find lines that were
+    # added here and have nowhere to go, and a heading sitting in that column
+    # would be counted as one of them for ever.
+    row = last + 2
+    c = ws.cell(row=row, column=1, value="THIS SHEET — TOTAL BY UNIT")
+    c.font = Font(bold=True, color="1F4E78")
+    c.alignment = LEFT
+    ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=5)
+    ws.cell(row=row, column=6, value="Qty (gross)").font = Font(bold=True, size=9)
+    for i, unit in enumerate(units, start=1):
+        r = row + i
+        ws.cell(row=r, column=3, value=unit).alignment = CENTER
+        total = ws.cell(row=r, column=6, value=(
+            f"=SUMIF($C${first}:$C${DETAIL_LAST_ROW},$C{r},"
+            f"$F${first}:$F${DETAIL_LAST_ROW})"))
+        total.number_format = "#,##0.000"
+        total.alignment = RIGHT
+        total.fill = TOTAL_FILL
+        for col in (3, 6):
+            ws.cell(row=r, column=col).border = BORDER
+    note = ws.cell(row=row + len(units) + 1, column=1, value=(
+        "These update themselves. Correct a quantity above and this block, the "
+        "Summary row and the set total all follow. To add a line, insert it "
+        "among the rows above and give it a description — if that description "
+        "is not already on the Summary, put it in the Summary's spare rows and "
+        "it will link itself."))
+    note.alignment = LEFT
+    ws.merge_cells(start_row=row + len(units) + 1, start_column=1,
+                   end_row=row + len(units) + 1, end_column=9)
+
+
+def write_queue_report(jobs, out_path: str | Path, *, project_name: str = "") -> Path:
+    """What the queue did, as a workbook.
+
+    The screen shows this while you are watching it. This is the version you
+    send to someone who was not: which drawings were read, how long each took,
+    which came back from the saved extraction rather than the model, and what
+    went wrong with the ones that failed.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Extraction log"
+
+    ws["A1"] = "EXTRACTION LOG"
+    ws["A1"].font = TITLE_FONT
+    done = [j for j in jobs if j.state == "done"]
+    failed = [j for j in jobs if j.state == "failed"]
+    cached = [j for j in done if j.from_cache]
+    model_time = sum(j.elapsed_s for j in done if not j.from_cache)
+    ws["A2"] = (f"{project_name or '(project)'}   ·   {len(done)} read, "
+                f"{len(failed)} failed, {len(cached)} served from a saved "
+                f"extraction   ·   {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    ws.merge_cells("A2:H2")
+    ws["A3"] = (f"{model_time / 60:.1f} minutes of extraction. The {len(cached)} "
+                f"cached drawing(s) cost none of it — a drawing is read once and "
+                f"reused by content, so a reissue is re-read and a copy is not.")
+    ws["A3"].alignment = LEFT
+    ws.merge_cells("A3:H3")
+
+    headers = ["#", "Drawing", "State", "Seconds", "From cache", "Profile",
+               "Result file", "Problem"]
+    for col, text in enumerate(headers, start=1):
+        c = ws.cell(row=5, column=col, value=text)
+        c.fill, c.font, c.alignment, c.border = HEADER_FILL, HEADER_FONT, CENTER, BORDER
+    for i, job in enumerate(jobs, start=1):
+        r = 5 + i
+        values = [i, job.drawing_name, job.state, round(job.elapsed_s, 1),
+                  "yes" if job.from_cache else "", job.profile,
+                  Path(job.json_path).name if job.json_path else "", job.error]
+        for col, value in enumerate(values, start=1):
+            c = ws.cell(row=r, column=col, value=value)
+            c.border = BORDER
+            c.alignment = RIGHT if col == 4 else (
+                CENTER if col in (1, 3, 5) else LEFT)
+        if job.state == "failed":
+            ws.cell(row=r, column=3).fill = ASSUMED_FILL
+            ws.cell(row=r, column=8).fill = ASSUMED_FILL
+    for col, width in {1: 5, 2: 44, 3: 11, 4: 10, 5: 12, 6: 11, 7: 40,
+                       8: 60}.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.freeze_panes = "A6"
+    wb.save(out_path)
+    return out_path

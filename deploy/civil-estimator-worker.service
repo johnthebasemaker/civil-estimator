@@ -1,0 +1,29 @@
+[Unit]
+Description=Civil Estimator extraction worker
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=estimator
+Group=estimator
+EnvironmentFile=/etc/civil-estimator/civil-estimator.env
+WorkingDirectory=/opt/civil-estimator
+ExecStart=/opt/civil-estimator/venv/bin/python bin/worker.py
+Restart=always
+RestartSec=10
+
+# SIGTERM asks the worker to finish the drawing it is on. Give it room: a slow
+# sheet on a CPU-only host genuinely takes minutes, and killing it mid-write
+# leaves a job that has to be read again from scratch.
+KillSignal=SIGTERM
+TimeoutStopSec=900
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/civil-estimator /opt/civil-estimator/output
+
+[Install]
+WantedBy=multi-user.target

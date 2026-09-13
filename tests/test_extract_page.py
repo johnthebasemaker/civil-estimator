@@ -91,6 +91,18 @@ def _page_with_drawing(extraction=None, project=None):
     return at
 
 
+@pytest.fixture(autouse=True)
+def _sandboxed_queue(tmp_path, monkeypatch):
+    """A queue of this test's own.
+
+    Without this the page renders against whatever is in the developer's real
+    `data/jobs.db`, so the same test passes or fails depending on what someone
+    extracted this morning.
+    """
+    monkeypatch.setenv("CIVIL_ESTIMATOR_JOBS_DB", str(tmp_path / "jobs.db"))
+    monkeypatch.setenv("CIVIL_ESTIMATOR_CACHE_DIR", str(tmp_path / "cache"))
+
+
 @pytest.mark.skipif(not SAMPLE_PDF.exists(), reason="sample drawing not in repo root")
 class TestExtractPageRenders:
     def test_stops_cleanly_with_no_drawing_ticked(self):
@@ -146,9 +158,16 @@ class TestExtractPageRenders:
 
         from openpyxl import load_workbook
         wb = load_workbook(written)
+        # The mandated ten-sheet template, in order. Gaps_and_Assumptions is
+        # inserted straight after the Summary when the drawing left something
+        # unstated, which is almost always — so it is skipped here rather than
+        # allowed to shift the ten.
+        template = [n for n in wb.sheetnames if n != "Gaps_and_Assumptions"]
         expected = ["Summary", "Assumptions", "Pedestals", "Slab", "Sump",
                     "Joints", "Coating", "Embedments", "Rebar_BBS", "Costing"]
-        assert wb.sheetnames[:10] == expected
+        assert template[:10] == expected
+        assert wb.sheetnames[1] == "Gaps_and_Assumptions", \
+            "the gaps belong where they will be read, not at the end"
         rows = [r for r in wb["Pedestals"].iter_rows(values_only=True)
                 if r and r[0] in TRUTH]
         assert len(rows) == len(TRUTH)
@@ -228,3 +247,104 @@ class TestDiscoveryPanel:
     def test_no_panel_when_the_sheet_specified_nothing(self):
         at = _page_with_drawing(extraction=_extraction())
         assert not any("Read from this drawing" in e.label for e in at.expander)
+
+
+@pytest.mark.skipif(not SAMPLE_PDF.exists(), reason="sample drawing not in repo root")
+class TestAMissingFigureNeverBlocks:
+    """The button used to be disabled unless the drawing produced a pedestal or
+    a slab. Five sheets in this set produce neither, so five sheets produced
+    nothing — and the missing figure was still missing afterwards."""
+
+    def _bare(self):
+        """An extraction with no pedestal and no slab, like a sections sheet."""
+        r = _extraction()
+        r.pedestals, r.grade_slabs = [], []
+        r.discovery = {
+            "items": [{"kind": "thickness",
+                       "description": "Acid Resistant Epoxy Coating, 4 mm thick",
+                       "spec": {"thickness_mm": 4.0}, "uom": "m2", "qty": None,
+                       "basis": "4 mm thick — area not stated on this sheet",
+                       "occurrences": 3, "confirm": True,
+                       "source": "4MM THK ACID RESISTANT", "grid_ref": "J-15"}],
+            "levels": [], "heights": [], "grades": [], "specifications": [],
+            "measured": 0, "to_confirm": 1}
+        return r
+
+    def test_the_generate_button_is_offered(self):
+        at = _page_with_drawing(extraction=self._bare())
+        assert not at.exception
+        gen = next((b for b in at.button
+                    if b.label.startswith("🧾") and "Generate BOQ" in b.label), None)
+        assert gen is not None, [b.label for b in at.button]
+        assert not gen.disabled, "a sections sheet still deserves a workbook"
+
+    def test_the_page_says_why_the_workbook_is_still_worth_having(self):
+        at = _page_with_drawing(extraction=self._bare())
+        assert any("still worth having" in i.value for i in at.info)
+
+    def test_the_gaps_are_shown_before_the_button(self):
+        at = _page_with_drawing(extraction=self._bare())
+        assert any("gap(s) and assumption(s)" in e.label for e in at.expander)
+
+    def test_it_generates(self, tmp_path):
+        at = _page_with_drawing(extraction=self._bare())
+        next(b for b in at.button
+             if b.label.startswith("🧾") and "Generate BOQ" in b.label).click().run()
+        assert not at.exception
+        # AppTest's session state is a SafeSessionState and has no .get().
+        assert "last_workbook" in at.session_state
+        assert Path(at.session_state["last_workbook"]).exists()
+
+    def test_the_workbook_carries_the_gaps_sheet(self):
+        from openpyxl import load_workbook
+
+        at = _page_with_drawing(extraction=self._bare())
+        next(b for b in at.button
+             if b.label.startswith("🧾") and "Generate BOQ" in b.label).click().run()
+        names = load_workbook(at.session_state["last_workbook"]).sheetnames
+        assert "Gaps_and_Assumptions" in names
+        assert "Drawing_Items" in names
+
+
+TEXT_LAYER_PDF = ROOT / "Drawings" / "MD-522-8110-EG-CV-LAD-0101_C01.pdf"
+
+
+@pytest.mark.skipif(not TEXT_LAYER_PDF.exists(), reason="drawings not present")
+class TestASheetThatNeedsNoModel:
+    """Found by driving the page with Ollama stopped: a drawing that is read
+    from its own text layer was still refusing to extract, because the button
+    was gated on the model being reachable rather than on the model being
+    needed."""
+
+    def _page(self):
+        at = AppTest.from_file(PAGE, default_timeout=300)
+        at.session_state[AUTH_KEY] = True
+        at.run()
+        box = next((c for c in at.checkbox
+                    if c.label.startswith(TEXT_LAYER_PDF.name)), None)
+        if box is None:
+            pytest.skip("drawing not in the library")
+        box.set_value(True).run()
+        return at
+
+    def test_the_page_says_no_model_calls_are_needed(self):
+        at = self._page()
+        calls = next(m for m in at.metric if m.label == "Model calls needed")
+        assert calls.value == "0"
+
+    def test_it_says_so_in_words_too(self):
+        at = self._page()
+        assert any("No model calls at all" in s.value for s in at.success)
+
+    def test_the_extract_button_is_not_blocked_by_a_stopped_model(self):
+        at = self._page()
+        button = next(b for b in at.button if b.label.startswith("🔍"))
+        assert not button.disabled
+
+    def test_extracting_works_and_costs_no_model_time(self):
+        at = self._page()
+        next(b for b in at.button if b.label.startswith("🔍")).click().run()
+        assert not at.exception
+        result = at.session_state["extraction"]
+        assert result.used_text_layer
+        assert result.montages_sent == 0

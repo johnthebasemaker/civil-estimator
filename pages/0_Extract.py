@@ -16,6 +16,8 @@ from __future__ import annotations
 import sitepath  # noqa: F401  (import first — it fixes the import path)
 
 import json
+import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -47,6 +49,10 @@ try:
     from core.derivation import (
         apply_derived, default_rules, derive, rules_from_findings,
     )
+    from core import extract_cache as CACHE
+    from core import gaps as GAPS
+    from core import jobstore as JS
+    from core import set_workbook as SW
 except ModuleNotFoundError as exc:  # pragma: no cover - environment repair path
     st.set_page_config(page_title="Civil Estimator", layout="wide")
     st.error(f"This page cannot start: {exc}")
@@ -109,157 +115,460 @@ def _rule_toggles(rules, *, key_prefix: str, disabled: bool = False) -> None:
                                     help=r.formula, disabled=disabled)
 
 
-def _batch_panel(drawings: list[Path]) -> None:
-    """Run several drawings end to end and roll the quantities up.
+def _owner() -> str:
+    """Whose queue this is.
+
+    One shared password today, so everyone is the same owner. The column exists
+    because the queue has to be ready for per-person accounts without a
+    migration, and because a shared queue where anyone can cancel anyone's batch
+    is only tolerable while the team is small.
+    """
+    return str(st.session_state.get("_user") or "shared")
+
+
+def _worker_alive(jobs: list) -> bool:
+    """Whether something is actually doing the work.
+
+    Worth showing plainly. A queue that fills up while no worker is running
+    looks identical to a slow model, and the difference is one command.
+    """
+    now = time.time()
+    return any(j.state == JS.RUNNING and now - j.heartbeat_at < 120 for j in jobs)
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
+@st.fragment(run_every="2s")
+def _queue_status() -> None:
+    """Live view of the queue. Reruns itself; the rest of the page does not.
+
+    This is what replaced running the batch inside the script. The work happens
+    in `bin/worker.py`, so pressing pause or cancel is answered in about two
+    seconds rather than at the end of a six-minute drawing — or, as before, not
+    at all.
+    """
+    owner = _owner()
+    jobs = JS.list_jobs(owner=owner)
+    if not jobs:
+        st.info("The queue is empty. Tick drawings above and add them.")
+        return
+
+    s = JS.summary(owner=owner)
+    counts = s["counts"]
+    running = s["running"]
+
+    if s["paused"]:
+        st.warning("Queue paused. The drawing in progress will finish; nothing "
+                   "new starts until you resume.", icon="⏸")
+    elif counts[JS.QUEUED] and not _worker_alive(jobs):
+        st.error("Nothing is processing this queue. Start the worker:", icon="⚠️")
+        st.code("venv/bin/python bin/worker.py", language="bash")
+
+    # The bar measures how much of the queue has been *processed*, and a failed
+    # drawing has been processed. Saying "100%" on its own would read as
+    # success, so failures are named beside the number and again above it.
+    if counts[JS.FAILED]:
+        failed_names = ", ".join(j.drawing_name for j in jobs
+                                 if j.state == JS.FAILED)[:200]
+        st.warning(f"{counts[JS.FAILED]} drawing(s) did not extract: "
+                   f"{failed_names}. The reason is in the Problem column below. "
+                   f"Fix it and press Retry failed.", icon="⚠️")
+    st.progress(min(1.0, s["percent"] / 100.0),
+                text=f"{s['percent']:.0f}% processed — {counts[JS.DONE]} read, "
+                     f"{counts[JS.QUEUED]} waiting, {counts[JS.FAILED]} failed")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Done", counts[JS.DONE])
+    m2.metric("Waiting", counts[JS.QUEUED])
+    m3.metric("Average per drawing",
+              _fmt_duration(s["mean_seconds"]) if s["mean_seconds"] else "—")
+    m4.metric("Estimated remaining",
+              _fmt_duration(s["eta_seconds"]) if s["eta_seconds"] else "—")
+
+    if running is not None:
+        st.progress(min(1.0, running.progress_pct / 100.0),
+                    text=f"▶ {running.drawing_name} — {running.progress_pct:.0f}% "
+                         f"· {running.stage or 'working'} · "
+                         f"{_fmt_duration(time.time() - running.started_at)} elapsed")
+
+    c1, c2, c3, c4 = st.columns(4)
+    if s["paused"]:
+        if c1.button("▶ Resume", use_container_width=True, key="q_resume"):
+            JS.set_paused(False, owner=owner)
+            st.rerun()
+    elif c1.button("⏸ Pause", use_container_width=True, key="q_pause",
+                   disabled=not counts[JS.QUEUED]):
+        JS.set_paused(True, owner=owner)
+        st.rerun()
+
+    if c2.button("⏹ Stop current", use_container_width=True, key="q_stop",
+                 disabled=running is None):
+        JS.request_cancel(running.id)
+        st.rerun()
+
+    if c3.button("✖ Cancel waiting", use_container_width=True, key="q_cancel",
+                 disabled=not counts[JS.QUEUED]):
+        JS.request_cancel([j.id for j in jobs if j.state == JS.QUEUED])
+        st.rerun()
+
+    if c4.button("↻ Retry failed", use_container_width=True, key="q_retry",
+                 disabled=not (counts[JS.FAILED] or counts[JS.CANCELLED])):
+        JS.retry([j.id for j in jobs
+                  if j.state in (JS.FAILED, JS.CANCELLED)])
+        st.rerun()
+
+    st.dataframe(pd.DataFrame([{
+        "Drawing": j.drawing_name,
+        "State": j.state,
+        "%": round(j.progress_pct),
+        "Stage": j.stage,
+        "Time": _fmt_duration(j.elapsed_s) if j.elapsed_s else "",
+        "From cache": "yes" if j.from_cache else "",
+        "Problem": j.error,
+    } for j in jobs]), hide_index=True, use_container_width=True)
+
+    st.caption("Nothing here disappears on its own. Finished rows stay until "
+               "you clear them, and the extraction JSON on disk survives even "
+               "that — clearing the queue costs no model time to undo.")
+    finished = counts[JS.DONE] + counts[JS.FAILED] + counts[JS.CANCELLED]
+    if st.session_state.get("_confirm_clear_queue"):
+        st.warning(f"Clear {finished} finished row(s) from the queue? The "
+                   f"drawings and their saved extractions are untouched, so "
+                   f"re-queueing them costs nothing.", icon="🧹")
+        y, n = st.columns(2)
+        if y.button("Yes, clear them", key="q_clear_yes", type="primary",
+                    use_container_width=True):
+            JS.clear(owner=owner)
+            st.session_state.pop("_confirm_clear_queue", None)
+            st.session_state.pop("drawing_picks", None)
+            st.session_state.pop("line_picks", None)
+            # A whole-app rerun, not a fragment one. Section 3 below is built
+            # from the finished jobs, so redrawing only this fragment leaves it
+            # listing drawings the queue no longer has.
+            st.rerun()
+        if n.button("Keep them", key="q_clear_no", use_container_width=True):
+            st.session_state.pop("_confirm_clear_queue", None)
+            st.rerun()
+    elif st.button("🧹 Clear finished rows", key="q_clear", disabled=not finished):
+        st.session_state["_confirm_clear_queue"] = True
+        st.rerun()
+
+
+def _queue_panel(drawings: list[Path]) -> None:
+    """Queue drawings for extraction, a sitting at a time.
 
     Deliberately separate from the single-drawing flow above: that flow exists
     so a person can correct what the model read before anything is written, and
-    there is no honest way to offer that for twenty sheets at once. A batch is
-    therefore explicitly a first pass — every workbook it writes still carries
-    the UNVERIFIED DRAFT banner and its own Verification sheet to be marked up.
+    there is no honest way to offer that for twenty sheets at once. A queued run
+    is explicitly a first pass — every workbook it produces still carries the
+    UNVERIFIED DRAFT banner and its own Verification sheet to be marked up.
     """
-    st.header("2 · Batch run")
-    st.caption(f"{len(drawings)} drawings ticked. Each is extracted, written to "
-               f"its own workbook, and summed into a roll-up.")
+    st.header("2 · Extraction queue")
+    st.caption(f"{len(drawings)} drawing(s) ticked. Add them to the queue and "
+               f"the worker reads them one at a time. You can close this tab: "
+               f"the queue is on disk, and finished drawings stay finished.")
 
-    minutes = len(drawings) * 5
-    st.warning(f"This takes roughly **{minutes} minutes** "
-               f"(~5 min per A0 sheet on this machine). The tab must stay open.",
-               icon="⏱")
+    owner = _owner()
+    cached = sum(1 for p in drawings
+                 if CACHE.load(JS.fingerprint(p, "thorough")) is not None)
+    if cached:
+        st.success(f"{cached} of these {len(drawings)} have been read before and "
+                   f"will come back instantly from the saved extraction. Only "
+                   f"{len(drawings) - cached} need the model.", icon="⚡")
 
-    st.markdown("**Derive the quantities the drawings do not print**")
-    if "batch_rules" not in st.session_state:
-        st.session_state.batch_rules = default_rules()
-    _rule_toggles(st.session_state.batch_rules, key_prefix="br_")
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        profile = st.selectbox(
+            "Profile", options=sorted(PROFILES), index=sorted(PROFILES).index("thorough"),
+            key="q_profile",
+            help="thorough and quick use the montage strategy and are the fast "
+                 "routes. sweep tiles the whole sheet and is the slow fallback "
+                 "for a drawing nothing else finds callouts on.")
+    with c2:
+        force = st.checkbox("Re-read even if saved", key="q_force",
+                            help="Tick this when a drawing has been reissued "
+                                 "under the same filename.")
 
-    o1, o2 = st.columns(2)
-    with o1:
-        want_audit = st.checkbox("Extraction_Log sheet", value=True, key="b_audit")
-    with o2:
-        want_check = st.checkbox("Check print per drawing", value=True,
-                                 key="b_check")
+    if st.button(f"➕ Add {len(drawings)} drawing(s) to the queue",
+                 type="primary", use_container_width=True):
+        added = JS.enqueue(drawings, owner=owner, profile=profile, force=force)
+        skipped = len(drawings) - len(added)
+        msg = f"Queued {len(added)} drawing(s)."
+        if skipped:
+            msg += f" {skipped} were already waiting or running."
+        st.success(msg)
 
-    if not st.button(f"🧾 Run {len(drawings)} drawings", type="primary",
-                     use_container_width=True, disabled=not ok):
+    st.divider()
+    _queue_status()
+
+def _entries_from_queue(owner: str, rules) -> "OrderedDict":
+    """Every finished drawing, rebuilt from its saved extraction.
+
+    Nothing here touches the model. The queue records where each result was
+    written and the cache holds it under the drawing's content hash, so this
+    runs in milliseconds no matter how many sittings the set took.
+    """
+    out: "OrderedDict[str, dict]" = OrderedDict()
+    for job in JS.list_jobs(owner=owner, states=[JS.DONE]):
+        result = CACHE.load(job.fingerprint)
+        if result is None:
+            continue
+        proj = Project(project_name=project.project_name, drawing_no="")
+        QV.merge_into_project(proj, result)
+        if not proj.drawing_no:
+            from core.filename import sanitise
+            proj.drawing_no = sanitise(job.path.stem)
+
+        derived_tags: set[str] = set()
+        seeded = rules_from_findings(rules, result.findings)
+        items = derive(proj, seeded)
+        if items:
+            derived_tags = {getattr(i.element, "tag", "") for i in items}
+            apply_derived(proj, items)
+        placeholders = {p.tag for p in proj.pedestals
+                        if abs(p.height_m - QV.PLACEHOLDER_HEIGHT_M) < 1e-9}
+        notes = []
+        if result.used_text_layer:
+            notes.append("read from the sheet's own text layer (no model calls)")
+        if job.from_cache:
+            notes.append("served from the saved extraction")
+        entry = SW.build_entry(
+            proj.drawing_no, proj, source_pdf=job.drawing_path,
+            derived_tags=derived_tags, placeholder_tags=placeholders,
+            notes=notes, position_marks=result.position_marks,
+            discovery=result.discovery)
+        out[proj.drawing_no] = {"entry": entry, "job": job, "result": result,
+                                "derived": items}
+    return out
+
+
+def _line_rows(entries) -> list[dict]:
+    """One selectable row per line item, across every extracted drawing."""
+    rows = []
+    for drawing_no, bundle in entries.items():
+        entry = bundle["entry"]
+        for line in entry.bom.lines:
+            if line.category == "ROLLUP":
+                continue
+            rows.append({
+                "key": f"{drawing_no}|boq|{line.category}|{line.item}|{line.unit}",
+                "Drawing": drawing_no, "Source": "BOQ",
+                "Group": line.category, "Description": line.item,
+                "UoM": line.unit, "Qty": round(line.qty_gross, 3),
+            })
+        for item in entry.discovered:
+            rows.append({
+                "key": f"{drawing_no}|read|{item['description']}|{item['uom']}",
+                "Drawing": drawing_no, "Source": "Read from drawing",
+                "Group": item.get("kind", ""), "Description": item["description"],
+                "UoM": item["uom"], "Qty": item.get("qty"),
+            })
+    return rows
+
+
+def _apply_selection(entries, chosen: set[str]) -> list:
+    """Keep only the ticked lines, and drop a drawing left with nothing."""
+    kept = []
+    for drawing_no, bundle in entries.items():
+        entry = bundle["entry"]
+        entry.bom.lines = [
+            l for l in entry.bom.lines
+            if l.category == "ROLLUP"
+            or f"{drawing_no}|boq|{l.category}|{l.item}|{l.unit}" in chosen]
+        items = [i for i in entry.discovered
+                 if f"{drawing_no}|read|{i['description']}|{i['uom']}" in chosen]
+        entry.discovery = {**entry.discovery, "items": items}
+        if entry.has_content:
+            kept.append(entry)
+    return kept
+
+
+def _results_panel() -> None:
+    """Pick the lines that belong in the BOQ, then build it.
+
+    Extraction and selection are separated on purpose. Reading twenty drawings
+    is machine time and happens over as many sittings as it takes; deciding what
+    is in the bill is an estimator's judgement and wants everything on one
+    screen.
+    """
+    owner = _owner()
+    done = JS.list_jobs(owner=owner, states=[JS.DONE])
+    if not done:
         return
 
-    import run_pipeline as RP
+    st.divider()
+    st.header("3 · Choose what goes in the BOQ")
 
-    bar = st.progress(0.0, text="starting…")
-    log = st.container()
-    outcomes: list = []
+    if "q_rules" not in st.session_state:
+        st.session_state.q_rules = default_rules()
+    with st.expander("Derive the quantities the drawings do not print",
+                     expanded=False):
+        _rule_toggles(st.session_state.q_rules, key_prefix="qr_")
 
-    for i, pdf_path in enumerate(drawings):
-        bar.progress(i / len(drawings), text=f"[{i + 1}/{len(drawings)}] {pdf_path.name}")
-        try:
-            res = QV.extract_from_pdf(pdf_path, client=client)
-            proj = Project(project_name="", drawing_no="")
-            plan = QV.plan_merge(proj, res)
-            QV.merge_into_project(proj, res)
+    all_entries = _entries_from_queue(owner, st.session_state.q_rules)
+    if not all_entries:
+        st.info("The finished extractions carry no quantities yet.")
+        return
 
-            items = derive(proj, st.session_state.batch_rules)
-            if items:
-                apply_derived(proj, items)
+    # ---- which drawings go into this bill ---------------------------------
+    # The set is read over several sittings, so "everything extracted" and
+    # "everything in this bill" are different lists. Ticking drawings here is
+    # what turns several separate extractions into one consolidated workbook.
+    st.markdown("**Drawings to combine into one BOQ**")
+    picks_d: dict = st.session_state.setdefault("drawing_picks", {})
+    for drawing_no in all_entries:
+        picks_d.setdefault(drawing_no, True)
 
-            if not proj.drawing_no:
-                from core.filename import sanitise
-                proj.drawing_no = sanitise(pdf_path.stem)
+    b1, b2, _ = st.columns([1, 1, 4])
+    if b1.button("Select all", use_container_width=True, key="dwg_all"):
+        for drawing_no in all_entries:
+            picks_d[drawing_no] = True
+        SC.rerun()
+    if b2.button("Clear", use_container_width=True, key="dwg_none"):
+        for drawing_no in all_entries:
+            picks_d[drawing_no] = False
+        SC.rerun()
 
-            if not (proj.pedestals or proj.grade_slabs):
-                # Still belongs in the set: a sections sheet carries no
-                # quantities, a plan sheet marks positions and references sizes
-                # elsewhere. Both contribute what they have.
-                marks = ", ".join(f"{k}x{v}" for k, v in res.position_marks.items())
-                note = "no BOQ quantities" + (f"; marks {marks}" if marks else "")
-                outcomes.append(RP.RunOutcome(pdf_path, True, proj, res,
-                                              notes=[note]))
-                log.warning(f"{pdf_path.name} — {note}")
-                continue
+    cols = st.columns(2)
+    for i, (drawing_no, bundle) in enumerate(all_entries.items()):
+        entry, job = bundle["entry"], bundle["job"]
+        n_boq = len([l for l in entry.bom.lines if l.category != "ROLLUP"])
+        n_read = len(entry.discovered)
+        suffix = " · from the saved extraction" if job.from_cache else ""
+        picks_d[drawing_no] = cols[i % 2].checkbox(
+            f"**{drawing_no}** — {n_boq} BOQ line(s), {n_read} read from the "
+            f"drawing{suffix}",
+            value=picks_d.get(drawing_no, True), key=f"dwg::{drawing_no}")
 
-            proj.created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-            bom = build_bom(proj)
-            bom.warnings = QV.extraction_warnings(res, plan) + bom.warnings
-            written = write_workbook(proj, bom,
-                                     build_output_path(proj.drawing_no, OUTPUT_DIR))
+    entries = OrderedDict((k, v) for k, v in all_entries.items() if picks_d.get(k))
+    if not entries:
+        st.warning("No drawing ticked. Tick at least one to build a BOQ.")
+        return
 
-            doc_g, page_g = R.open_page(pdf_path, 0)
-            try:
-                grid = SG.detect_grid(page_g)
-                WE.append_verification_sheet(written, res, grid)
-                if items:
-                    WE.append_derivation_sheet(written, items)
-                WE.append_discovery_sheet(written, res)
-                if want_audit:
-                    WE.append_audit_sheet(written, res, plan)
-                check = None
-                if want_check:
-                    check = VER.build_check_print(
-                        page_g, res, grid=grid,
-                        out_path=OUTPUT_DIR / f"{pdf_path.stem}_check.png")
-            finally:
-                doc_g.close()
+    st.divider()
+    rows = _line_rows(entries)
+    st.caption(f"{len(rows)} line(s) from {len(entries)} of "
+               f"{len(all_entries)} extracted drawing(s). Untick anything that "
+               f"does not belong in this bill.")
 
-            placeholders = {p.tag for p in proj.pedestals
-                            if abs(p.height_m - QV.PLACEHOLDER_HEIGHT_M) < 1e-9}
-            notes = []
-            if res.used_text_layer:
-                notes.append("read from the sheet's own text layer (no model calls)")
-            if res.position_marks:
-                notes.append("marks counted: " + ", ".join(
-                    f"{k}x{v}" for k, v in res.position_marks.items()))
-            outcomes.append(RP.RunOutcome(
-                pdf_path, True, proj, res, written, check,
-                derived_tags={getattr(i.element, "tag", "") for i in items},
-                placeholder_tags=placeholders, notes=notes))
-            log.success(f"{pdf_path.name} — {len(bom.lines)} BOQ lines → "
-                        f"{written.name}")
-        except Exception as exc:               # noqa: BLE001 — one bad sheet
-            outcomes.append(RP.RunOutcome(pdf_path, False,
-                                          error=f"{type(exc).__name__}: {exc}"))
-            log.error(f"{pdf_path.name} — {exc}")
+    f1, f2, f3, f4 = st.columns([2, 2, 1, 1])
+    which = f1.multiselect("Filter by drawing", sorted(entries), default=[],
+                           key="sel_dwg")
+    kinds = f2.multiselect("Filter by source", ["BOQ", "Read from drawing"],
+                           default=[], key="sel_src")
+    visible = [r for r in rows
+               if (not which or r["Drawing"] in which)
+               and (not kinds or r["Source"] in kinds)]
 
-    bar.progress(1.0, text="done")
-    from core import set_workbook as SW
-    entries = [SW.build_entry(o.project.drawing_no, o.project,
-                              source_pdf=str(o.pdf), derived_tags=o.derived_tags,
-                              placeholder_tags=o.placeholder_tags, notes=o.notes,
-                              position_marks=(o.result.position_marks
-                                              if o.result else {}),
-                              discovery=(o.result.discovery
-                                         if o.result else {}))
-               for o in outcomes if o.ok and o.project]
-    consolidated = (SW.write_set_workbook(entries, OUTPUT_DIR / "SET_BOQ.xlsx",
-                                          project_name=project.project_name)
-                    if entries else None)
-    rollup = RP.write_rollup(outcomes, OUTPUT_DIR / "SET_ROLLUP.xlsx")
-    st.session_state["batch_outcomes"] = [
-        {"drawing": o.pdf.name, "ok": o.ok,
-         "workbook": str(o.workbook) if o.workbook else "",
-         "error": o.error} for o in outcomes]
+    picks: dict = st.session_state.setdefault("line_picks", {})
+    for row in rows:
+        picks.setdefault(row["key"], row["Source"] == "BOQ")
 
-    good = sum(1 for o in outcomes if o.ok)
-    st.success(f"{good} of {len(outcomes)} drawing(s) produced a workbook.")
-    st.dataframe(pd.DataFrame(st.session_state["batch_outcomes"]),
-                 hide_index=True, use_container_width=True)
-    dl1, dl2 = st.columns(2)
-    if consolidated:
-        with dl1, open(consolidated, "rb") as fh:
-            st.download_button("⬇️  Download consolidated BOQ (.xlsx)",
-                               data=fh.read(), file_name=consolidated.name,
-                               type="primary", use_container_width=True,
-                               mime="application/vnd.openxmlformats-officedocument."
-                                    "spreadsheetml.sheet")
-        st.caption("One Summary sheet: Sl. #, Description, UoM, then a quantity "
-                   "column per drawing. Shaded cells are assumptions, not "
-                   "readings. Detail sheets follow, named by drawing and activity.")
-    with dl2, open(rollup, "rb") as fh:
-        st.download_button("⬇️  Download status roll-up (.xlsx)", data=fh.read(),
-                           file_name=rollup.name, use_container_width=True,
-                           mime="application/vnd.openxmlformats-officedocument."
-                                "spreadsheetml.sheet")
-    st.caption("Every workbook carries the UNVERIFIED DRAFT banner and its own "
-               "Verification sheet. Check each one against its drawing before "
-               "pricing.")
+    if f3.button("Select all", use_container_width=True, key="sel_all"):
+        for row in visible:
+            picks[row["key"]] = True
+        SC.rerun()
+    if f4.button("Clear", use_container_width=True, key="sel_none"):
+        for row in visible:
+            picks[row["key"]] = False
+        SC.rerun()
+
+    table = pd.DataFrame([{**{"Include": picks[r["key"]]},
+                           **{k: v for k, v in r.items() if k != "key"}}
+                          for r in visible])
+    edited = st.data_editor(
+        table, hide_index=True, use_container_width=True, height=420,
+        disabled=["Drawing", "Source", "Group", "Description", "UoM", "Qty"],
+        column_config={"Include": st.column_config.CheckboxColumn(
+            "Include", help="Ticked lines go into the BOQ")},
+        key="line_editor")
+    for row, include in zip(visible, edited["Include"].tolist()):
+        picks[row["key"]] = bool(include)
+
+    chosen = {k for k, v in picks.items() if v}
+    st.caption(f"{len(chosen)} line(s) ticked.")
+
+    if st.button(f"🧾 Generate one combined BOQ from {len(entries)} drawing(s)",
+                 type="primary", use_container_width=True, disabled=not chosen):
+        kept = _apply_selection(entries, chosen)
+        if not kept:
+            st.error("Nothing ticked on any drawing.")
+        else:
+            out = SW.write_set_workbook(
+                kept, OUTPUT_DIR / "SET_BOQ.xlsx",
+                project_name=project.project_name)
+            st.session_state["set_boq_path"] = str(out)
+            st.session_state["set_boq_built"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+            st.session_state["set_boq_lines"] = len(chosen)
+            st.session_state["set_boq_drawings"] = len(kept)
+
+    _download_panel()
+
+
+def _download_panel() -> None:
+    """Results stay on screen until they are explicitly cleared.
+
+    The previous version built its download buttons inside the run that produced
+    them. Clicking a download triggers a rerun, the run did not happen again, so
+    the buttons and the file paths went with it — which looked exactly like the
+    work had been thrown away.
+    """
+    path = st.session_state.get("set_boq_path")
+    if not path or not Path(path).exists():
+        return
+    path = Path(path)
+    st.success(f"Consolidated BOQ built {st.session_state.get('set_boq_built', '')} "
+               f"— {st.session_state.get('set_boq_drawings', 0)} drawing(s), "
+               f"{st.session_state.get('set_boq_lines', 0)} line(s).")
+    d1, d2 = st.columns([2, 1])
+    with d1, open(path, "rb") as fh:
+        st.download_button(
+            "⬇️  Download consolidated BOQ (.xlsx)", data=fh.read(),
+            file_name=path.name, type="primary", use_container_width=True,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.caption(f"Also saved at `{path}`. Download it as many times as you like; "
+               f"nothing is removed until you press the button below.")
+    report = SW.write_queue_report(
+        JS.list_jobs(owner=_owner()), OUTPUT_DIR / "SET_EXTRACTION_LOG.xlsx",
+        project_name=project.project_name)
+    with open(report, "rb") as fh:
+        st.download_button(
+            "⬇️  Download extraction log (.xlsx)", data=fh.read(),
+            file_name=report.name, use_container_width=True,
+            key="dl_queue_report",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.caption("Which drawings were read, how long each took, and which came "
+               "back from a saved extraction rather than the model.")
+    with d2:
+        if st.session_state.get("_confirm_clear_result"):
+            if st.button("Yes, clear it", key="clear_result_yes",
+                         use_container_width=True):
+                for key in ("set_boq_path", "set_boq_built", "set_boq_lines",
+                            "set_boq_drawings", "_confirm_clear_result"):
+                    st.session_state.pop(key, None)
+                SC.rerun()
+            if st.button("Keep it", key="clear_result_no",
+                         use_container_width=True):
+                st.session_state.pop("_confirm_clear_result", None)
+                SC.rerun()
+        elif st.button("🧹 Clear this result", use_container_width=True,
+                       key="clear_result"):
+            st.session_state["_confirm_clear_result"] = True
+            SC.rerun()
+    if st.session_state.get("_confirm_clear_result"):
+        st.warning("Clear the link to this workbook? The file stays on disk at "
+                   "the path above, so this only removes it from the screen.",
+                   icon="🧹")
+    st.info("Every quantity in the Summary is a live link into that drawing's "
+            "own activity sheet. Correct a net quantity or a wastage percentage "
+            "there and the Summary and the set total follow.", icon="🔗")
 
 
 st.header("1 · Drawings")
@@ -373,12 +682,23 @@ if selected and not deletable:
     st.caption("Files in the project root are not deleted from this page.")
 
 if not selected:
-    st.info("Tick a drawing to work on it.")
+    # No drawing ticked is not the same as nothing to do. Work queued in an
+    # earlier sitting is still there, and so is everything already extracted —
+    # the whole point of a queue that outlives the tab.
+    if JS.list_jobs(owner=_owner()):
+        st.info("Tick a drawing to work on it, or pick up where you left off "
+                "below.")
+        st.header("2 · Extraction queue")
+        _queue_status()
+        _results_panel()
+    else:
+        st.info("Tick a drawing to work on it.")
     st.stop()
 
 if len(selected) > 1:
     st.session_state.pop("extraction", None)
-    _batch_panel(selected)
+    _queue_panel(selected)
+    _results_panel()
     st.stop()
 
 source_pdf = selected[0]
@@ -411,20 +731,32 @@ try:
     blocks = VT.find_text_blocks(page)
     candidates = VT.callout_candidates(blocks)
     montages = VT.build_montages(page, candidates)
+    # A sheet that kept its own text layer is read from characters, not pixels.
+    # Knowing that here is what lets the page say "no model calls" honestly, and
+    # what stops it refusing to extract when Ollama happens to be down.
+    from extractors import text_layer as TL
+    reads_from_text = TL.has_usable_text(page)
 finally:
     doc.close()
+
+model_calls = 0 if reads_from_text else len(montages) + 2
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Sheet", info["sheet_size"])
 c2.metric("Text blocks found", len(blocks))
 c3.metric("Callout candidates", len(candidates))
-c4.metric("Model calls needed", len(montages) + 2)
+c4.metric("Model calls needed", model_calls)
 
-if not info["has_text_layer"]:
+if reads_from_text:
+    st.success("This sheet kept its own text layer, so it is read from the "
+               "characters themselves: exact values, exact positions, in about "
+               "a fifth of a second. **No model calls at all**, and the local "
+               "model does not need to be running.", icon="⚡")
+elif not info["has_text_layer"]:
     st.info("This PDF has no text layer — the text is drawn as curves, so a text "
             "parser would return nothing. The blocks above were located from the "
             "drawing's vector geometry, which costs no model time.")
-if not candidates:
+if not candidates and not reads_from_text:
     st.warning("No text blocks located. If this sheet is a scan rather than CAD "
                "vector output, choose the **sweep** profile below — it looks at "
                "the whole sheet instead, but takes far longer.")
@@ -439,7 +771,9 @@ SC.image(pv2, tb_preview.png, caption="Title block (read first)")
 # ======================================================================
 st.header("3 · Extract")
 
-if ok:
+if reads_from_text:
+    st.caption("The local model is not consulted for this sheet.")
+elif ok:
     st.success(f"Local model ready — {msg}")
 else:
     st.error(f"Local model unavailable — {msg}")
@@ -455,12 +789,23 @@ with e1:
 cfg = ExtractionConfig(**PROFILES[profile].__dict__)
 n_calls = (len(montages) + 2 if cfg.strategy == "montage"
            else len(QV._tile_plan(cfg)) + 2)
+if reads_from_text and cfg.strategy == "montage":
+    n_calls = 0
 with e2:
-    st.caption(f"About **{n_calls} model calls ≈ {n_calls * 48 // 60} min "
-               f"{n_calls * 48 % 60} s** on this machine. The window can stay "
-               f"in the background, but leave it open.")
+    if n_calls:
+        st.caption(f"About **{n_calls} model calls ≈ {n_calls * 48 // 60} min "
+                   f"{n_calls * 48 % 60} s** on this machine. The window can "
+                   f"stay in the background, but leave it open.")
+    else:
+        st.caption("**Under a second**, and no model time at all. Choosing the "
+                   "sweep profile would override that and look at pixels "
+                   "instead, which is only worth doing if the text layer turns "
+                   "out to be wrong.")
 
-if st.button("🔍 Extract drawing", type="primary", disabled=not ok,
+# Only the model's absence blocks extraction, and only for a sheet that needs
+# it. Refusing to read a drawing whose own text layer answers the question was
+# the reason five of these sheets looked unextractable.
+if st.button("🔍 Extract drawing", type="primary", disabled=not (ok or n_calls == 0),
              use_container_width=True):
     bar = st.progress(0.0, text="starting…")
 
@@ -734,8 +1079,30 @@ with g3:
                              help="The drawing with every extracted value boxed "
                                   "and quoted by grid square — for marking up.")
 
-if st.button("🧾 Generate BOQ Excel", type="primary", use_container_width=True,
-             disabled=not (pedestals or slabs)):
+# What the drawing did not say. Shown before the button, and never in front of
+# it: a sections sheet gives no pedestal and no slab, and refusing to produce a
+# workbook for it was how five drawings in this set produced nothing at all. A
+# bill with a stated gap tells an engineer which figure to supply and where.
+_gap_project = Project(project_name="", drawing_no="")
+_gap_project.pedestals, _gap_project.grade_slabs = pedestals, slabs
+gap_report = GAPS.report_for(_gap_project, result, derived=derived_preview,
+                             placeholder_height_m=QV.PLACEHOLDER_HEIGHT_M)
+if gap_report.needs_attention:
+    with st.expander(f"⚠️ {gap_report.needs_attention} gap(s) and assumption(s) "
+                     f"— the workbook is produced anyway", expanded=not (pedestals or slabs)):
+        st.caption(gap_report.headline())
+        st.dataframe(pd.DataFrame(gap_report.as_rows()), hide_index=True,
+                     use_container_width=True)
+        st.caption("This table becomes the **Gaps_and_Assumptions** sheet in the "
+                   "workbook, right after the Summary.")
+
+if not (pedestals or slabs):
+    st.info("No pedestal or grade slab on this sheet. The workbook is still "
+            "worth having: it carries whatever the drawing specifies on its "
+            "Drawing_Items sheet, and the gaps above on their own sheet.",
+            icon="ℹ️")
+
+if st.button("🧾 Generate BOQ Excel", type="primary", use_container_width=True):
     target_project = project if merge_first else Project(project_name="", drawing_no="")
 
     for field_name, value in (("drawing_no", tb.drawing_no), ("revision", tb.revision),
@@ -776,6 +1143,7 @@ if st.button("🧾 Generate BOQ Excel", type="primary", use_container_width=True
             if derived_items:
                 WE.append_derivation_sheet(written, derived_items)
             WE.append_discovery_sheet(written, result)
+            WE.append_gaps_sheet(written, gap_report)
             if audit:
                 WE.append_audit_sheet(written, result, plan)
             if want_check:

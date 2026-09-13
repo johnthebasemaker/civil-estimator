@@ -269,3 +269,48 @@ def append_discovery_sheet(xlsx_path: str | Path, result: ExtractionResult) -> P
     ws.freeze_panes = f"A{head + 1}"
     wb.save(path)
     return path
+
+
+def append_gaps_sheet(xlsx_path: str | Path, report) -> Path:
+    """What the drawing did not say, and what was assumed instead.
+
+    This sheet is the reason the workbook is produced at all for a drawing that
+    the priced sheets cannot cover. A bill with a stated gap tells the engineer
+    which figure to supply and where; a bill that was never generated tells them
+    nothing, and the figure is still missing either way.
+    """
+    path = Path(xlsx_path)
+    rows = report.as_rows() if report is not None else []
+    if not rows:
+        return path
+
+    wb = load_workbook(path)
+    if "Gaps_and_Assumptions" in wb.sheetnames:
+        del wb["Gaps_and_Assumptions"]
+    ws = wb.create_sheet("Gaps_and_Assumptions", 1)   # right after Summary
+
+    ws["A1"] = "GAPS AND ASSUMPTIONS"
+    ws["A1"].font = TITLE_FONT
+    ws["A2"] = report.headline()
+    ws["A2"].alignment = LEFT
+    ws.merge_cells("A2:G2")
+    ws["A3"] = ("Ranked by how the number should be treated, not by how bad it "
+                "is. 'Assumed' is the row to watch: a number is present and did "
+                "not come off the drawing, so it looks like every other number.")
+    ws["A3"].alignment = LEFT
+    ws.merge_cells("A3:G3")
+
+    head = 5
+    headers = list(rows[0].keys())
+    _header_row(ws, head, headers)
+    for i, row in enumerate(rows, start=1):
+        r = head + i
+        for col, key in enumerate(headers, start=1):
+            c = ws.cell(row=r, column=col, value=row[key])
+            c.alignment = LEFT
+        if row["Severity"].startswith(("Assumed", "Not priced")):
+            ws.cell(row=r, column=1).fill = ENTRY_FILL
+    _widths(ws, {1: 26, 2: 30, 3: 46, 4: 44, 5: 40, 6: 44, 7: 34})
+    ws.freeze_panes = f"A{head + 1}"
+    wb.save(path)
+    return path

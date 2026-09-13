@@ -42,10 +42,16 @@ civil-estimator/
 │ ├── formulas.py # Pure calc functions (volumes, formwork, rebar wt)
 │ ├── bom_builder.py # Walks Project → produces BOM lines + BBS
 │ ├── excel_writer.py # 10-sheet workbook writer (openpyxl)
+│ ├── jobstore.py # Durable extraction queue (SQLite, WAL)
+│ ├── extract_cache.py # Content-addressed reuse of saved extractions
+│ ├── gaps.py # What the drawing did not say, and what was assumed
 │ ├── rate_library.py # SQLite rate persistence (Step 6)
 │ └── filename.py # Output filename builder
-├── bin/app.sh # Launcher — uses venv/bin/streamlit (PyMuPDF lives there)
+├── bin/ce # One command: start, stop, restart, status, logs
+├── bin/app.sh # Launcher for the app alone (bin/ce calls the same thing)
+├── bin/worker.py # Extraction worker — the process that talks to the model
 ├── sitepath.py # Import-path repair so any interpreter can start the app
+├── deploy/ # systemd units, nginx site, install script (docs/DEPLOYMENT.md)
 ├── run_pipeline.py # Phase 2 CLI: PDF → extraction → BOM → workbook
 ├── extractors/ # Phase 2 — local vision extraction
 │ ├── models.py # TitleBlockExtraction, PedestalExtraction, ExtractionResult
@@ -568,3 +574,110 @@ omits it is back to producing nothing.
 A drawing whose text layer survived costs **no model calls at all**, so the CLI
 no longer refuses to run when Ollama is down if every sheet in the batch can be
 read from text.
+
+---
+
+## Extraction runs outside the app
+
+Reading twenty drawings used to happen inside the Streamlit script. Streamlit
+cannot redraw or accept a click while a script is running, so the tab froze for
+the length of the batch, and a cancel button was not merely missing but
+impossible — there was no moment in which the app could notice it.
+
+Now the app only ever writes to a queue. A separate process does the work, and
+one command owns both:
+
+```bash
+./bin/ce
+```
+
+That starts the worker and the app, follows both logs, and stops both on Ctrl-C.
+`./bin/ce stop` clears up a stray, `./bin/ce status` says what is running and
+how the queue looks, and `./bin/ce start` returns you to the prompt instead of
+tailing the logs. Stopping is always SIGTERM first: the worker finishes the
+drawing it is on rather than leaving a half-written file.
+
+The queue is a SQLite table, not a list in memory, which is what makes the rest
+of it true. Close the tab and finished drawings stay finished. Restart the
+worker mid-drawing and that drawing goes back to the queue rather than being
+lost. Come back tomorrow, tick four more sheets, and the ones already read are
+skipped.
+
+| You press | What happens |
+|---|---|
+| Pause | the drawing in flight finishes, nothing new starts |
+| Stop current | the worker notices between model calls and stops cleanly |
+| Cancel waiting | queued drawings are dropped, the running one is left alone |
+| Retry failed | failed and cancelled drawings go to the back of the queue |
+
+Nothing is killed from outside. A job interrupted mid-write leaves a workbook
+that looks finished and is not.
+
+### A drawing is read once
+
+Every extraction is cached under a hash of the PDF's bytes plus the profile, so
+the second request for the same drawing is served in milliseconds. Copy a
+drawing into another folder and it still hits. Reissue it under the same
+filename and the hash changes, so it is read again — the mistake that matters
+here is serving last revision's numbers without saying so.
+
+`bin/worker.py --once` drains the queue and exits, which is the form to use from
+cron or a test.
+
+### Choosing what goes in the bill
+
+Extraction and selection are separate steps on purpose. Reading is machine time
+and happens over as many sittings as it takes; deciding what belongs in the BOQ
+is an estimator's judgement and wants every line on one screen. Section 3 of the
+Extract page lists every line item from every drawing read so far, filterable by
+drawing and by source, with a tick box on each. The workbook is built from the
+ticked lines only.
+
+Results do not disappear. The download panel reads from disk and stays until you
+press Clear.
+
+## The workbook is linked, not copied
+
+Each quantity in the Summary is a `SUMIF` into that drawing's own activity
+sheet, and each `Qty (gross)` on an activity sheet is `net x (1 + wastage)`.
+Correct a net quantity on `0107_Concrete` and three things follow on their own:
+the gross beside it, that sheet's per-unit subtotal, and the Summary row and set
+total above it.
+
+The same holds for the items read from the drawing. A row whose quantity is
+blank is the sheet stating a specification without an extent; type the area on
+that drawing's `_Drawing items` sheet and it appears in the Summary.
+
+One limit worth knowing. The link matches on the description, so a line your
+team **adds** to a detail sheet with a description that is not already in the
+Summary will total correctly on its own sheet but will not create a Summary row.
+Copy an existing description if you want it to roll up.
+
+## Hosting
+
+See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** for the server build, including
+what to buy from Hetzner, the systemd units in `deploy/`, and why this stays on
+SQLite rather than moving to PostgreSQL.
+
+## A missing figure never blocks the workbook
+
+The Generate BOQ button used to be disabled unless the drawing produced a
+pedestal or a grade slab. Five sheets in this set produce neither, so five
+sheets produced nothing at all — and the figure that was missing stayed missing
+either way.
+
+Now the workbook is always produced, and what the drawing did not say goes on
+its own **Gaps_and_Assumptions** sheet, right behind the Summary. Each row
+carries four things: what is missing, what was used instead, what that affects,
+and where to put the right answer. They are ranked by how the number should be
+treated rather than by how bad it is:
+
+| | Meaning |
+|---|---|
+| Not priced | the quantity is absent from the bill, not wrong in it |
+| Assumed | a number is present and did not come off the drawing |
+| Needs one figure from you | a specification with no extent; supply it and the row prices itself |
+| For information | provenance worth knowing, nothing to do |
+
+**Assumed** is the row to watch. It is the only class that looks exactly like
+every other number in the bill.

@@ -11,3 +11,7 @@ output/
 !templates/*.xlsx
 .pytest_cache/
 .DS_Store
+.run/
+data/jobs.db
+data/jobs.db-wal
+data/jobs.db-shm

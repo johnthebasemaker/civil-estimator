@@ -37,6 +37,7 @@ from core.derivation import (
 )
 from core.excel_writer import write_workbook
 from core.filename import build_output_path, sanitise
+from core import gaps as GAPS
 from core import set_workbook as SW
 from core.models import Project
 from extractors import qwen_vision as QV
@@ -279,6 +280,9 @@ def process_one(pdf_path: Path, args, client: OllamaClient | None) -> RunOutcome
         # Not conditional on `derived`: a sheet with nothing to derive from
         # is exactly the sheet whose only content is what it names itself.
         WE.append_discovery_sheet(written, result)
+        WE.append_gaps_sheet(written, GAPS.report_for(
+            project, result, derived=derived,
+            placeholder_height_m=QV.PLACEHOLDER_HEIGHT_M))
         if args.audit_sheet:
             WE.append_audit_sheet(written, result, plan)
 

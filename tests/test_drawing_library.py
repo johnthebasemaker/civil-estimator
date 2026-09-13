@@ -135,15 +135,20 @@ class TestDeleteGuards:
 
 
 class TestBatchSwitch:
-    def test_several_ticked_drawings_switch_to_the_batch_panel(self, library):
+    def test_several_ticked_drawings_switch_to_the_queue(self, library):
         at = _run()
         next(b for b in at.button if b.label == "Select all").click().run()
         headers = [h.value for h in at.header]
-        assert any("Batch run" in h for h in headers)
+        assert any("Extraction queue" in h for h in headers)
 
     def test_one_ticked_drawing_keeps_the_single_flow(self, library):
         at = _run()
         _boxes(at, library)[0].set_value(True).run()
         headers = [h.value for h in at.header]
         assert any("Sheet" in h for h in headers)
-        assert not any("Batch run" in h for h in headers)
+        assert not any("Extraction queue" in h for h in headers)
+
+    def test_the_queue_offers_to_add_the_ticked_drawings(self, library):
+        at = _run()
+        next(b for b in at.button if b.label == "Select all").click().run()
+        assert any("Add" in b.label and "queue" in b.label for b in at.button)

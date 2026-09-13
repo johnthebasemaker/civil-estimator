@@ -30,6 +30,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SECRETS_PATH = ROOT / ".streamlit" / "secrets.toml"
 
+# A credential does not belong inside a container image or a git checkout. This
+# lets the password file live wherever the deployment keeps its secrets — a
+# mounted file under /etc, a Docker secret — without moving the app. Read at
+# call time so the web app and the worker can be told separately.
+SECRETS_ENV = "CIVIL_ESTIMATOR_SECRETS"
+
+
+def secrets_path() -> Path:
+    return Path(os.environ.get(SECRETS_ENV) or SECRETS_PATH)
+
+
 ITERATIONS = 240_000
 SALT_BYTES = 16
 MAX_ATTEMPTS = 5           # before a cool-off
@@ -58,7 +69,7 @@ def verify_password(plain: str, salt_hex: str, hash_hex: str,
 # ---------- Stored credential ----------
 def load_credential(path: Path | None = None) -> dict | None:
     """The configured credential, or None when the app has no password yet."""
-    path = Path(path or SECRETS_PATH)
+    path = Path(path) if path else secrets_path()
     if not path.exists():
         return None
     try:
@@ -80,7 +91,7 @@ def load_credential(path: Path | None = None) -> dict | None:
 
 def save_credential(plain: str, path: Path | None = None, hint: str = "") -> Path:
     """Write a new password hash, preserving anything else in the file."""
-    path = Path(path or SECRETS_PATH)
+    path = Path(path) if path else secrets_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
     existing = ""

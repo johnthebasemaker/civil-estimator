@@ -6,6 +6,7 @@ assumptions marked rather than blended in with values read off a drawing.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -293,3 +294,170 @@ class TestDoubleCounting:
                 break
         else:
             pytest.fail("discovered row not found")
+
+
+# ---------------------------------------------------------------------------
+# The Summary does not hold copies of the quantities; it reads them out of each
+# drawing's activity sheet. So a correction made where an engineer is actually
+# looking reaches the set total without anyone retyping it.
+# ---------------------------------------------------------------------------
+SUMIF_RE = re.compile(
+    r"=SUMIF\('([^']+)'!\$([A-Z])\$(\d+):\$[A-Z]\$(\d+),\$B(\d+),"
+    r"'([^']+)'!\$([A-Z])\$\d+:\$[A-Z]\$\d+\)")
+
+
+def _sumifs(ws):
+    for row in ws.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value.startswith("=SUMIF"):
+                m = SUMIF_RE.match(cell.value)
+                assert m, f"unparsable formula: {cell.value}"
+                yield cell, m
+
+
+class TestLinkedQuantities:
+    @pytest.fixture(scope="class")
+    def book(self, tmp_path_factory):
+        out = tmp_path_factory.mktemp("linked") / "SET.xlsx"
+        SW.write_set_workbook(_entries(), out, project_name="Linked")
+        return load_workbook(out)
+
+    def test_the_summary_reads_from_the_detail_sheets(self, book):
+        found = list(_sumifs(book["Summary"]))
+        assert found, "the Summary is still holding copies of the quantities"
+
+    def test_every_link_points_at_a_sheet_that_exists(self, book):
+        for cell, m in _sumifs(book["Summary"]):
+            assert m.group(1) in book.sheetnames, f"{cell.coordinate} -> {m.group(1)}"
+
+    def test_every_link_finds_its_row_on_that_sheet(self, book):
+        """A lookup that matches nothing silently reads zero, which is the worst
+        possible failure for a bill of quantities."""
+        ws = book["Summary"]
+        for cell, m in _sumifs(ws):
+            sheet, first, last, key_row = (m.group(1), int(m.group(3)),
+                                           int(m.group(4)), int(m.group(5)))
+            want = ws.cell(row=key_row, column=2).value
+            have = {book[sheet].cell(row=r, column=2).value
+                    for r in range(first, last + 1)}
+            assert want in have, f"{sheet!r} has no row named {want!r}"
+
+    def test_gross_is_computed_on_the_sheet_not_baked_in(self, book):
+        ws = book["0106_Concrete"]
+        formula = ws.cell(row=5, column=6).value
+        assert isinstance(formula, str) and formula.startswith("=")
+        assert "D5" in formula and "E5" in formula
+
+    def test_correcting_a_net_quantity_moves_the_set_total(self, book):
+        """Evaluated by hand: openpyxl stores formulas, Excel computes them."""
+        ws = book["Summary"]
+        target = "RCC_M30 - Grade Slab GS-01"
+        cell, m = next((c, mm) for c, mm in _sumifs(ws)
+                       if ws.cell(row=int(mm.group(5)), column=2).value == target)
+        sheet, first, last = m.group(1), int(m.group(3)), int(m.group(4))
+        detail = book[sheet]
+        rows = [r for r in range(first, last + 1)
+                if detail.cell(row=r, column=2).value == target]
+        assert rows, "nothing for the Summary to read"
+        before = sum(detail.cell(row=r, column=4).value
+                     * (1 + detail.cell(row=r, column=5).value / 100) for r in rows)
+        detail.cell(row=rows[0], column=4).value = 999.0
+        after = sum(detail.cell(row=r, column=4).value
+                    * (1 + detail.cell(row=r, column=5).value / 100) for r in rows)
+        assert after != before
+
+    def test_each_sheet_totals_itself_by_unit(self, book):
+        """One total at the foot would add m3 to m2, and somebody would price it."""
+        ws = book["0106_Concrete"]
+        text = "\n".join(str(c.value) for row in ws.iter_rows()
+                         for c in row if c.value)
+        assert "THIS SHEET — TOTAL BY UNIT" in text
+
+    def test_those_subtotals_are_formulas_too(self, book):
+        ws = book["0106_Concrete"]
+        formulas = [c.value for row in ws.iter_rows() for c in row
+                    if isinstance(c.value, str) and c.value.startswith("=SUMIF")]
+        assert formulas, "the per-unit subtotals are static"
+
+
+class TestLinesAddedByHand:
+    """The one real limit of matching on a description: a line your team adds
+    to a detail sheet has no Summary row to land in. Rather than leave that as
+    a footnote, the Summary carries spare rows that are already wired, and a
+    count that makes a missed line visible."""
+
+    @pytest.fixture(scope="class")
+    def book(self, tmp_path_factory):
+        out = tmp_path_factory.mktemp("spare") / "SET.xlsx"
+        SW.write_set_workbook(_entries(), out, project_name="Spare")
+        return load_workbook(out)
+
+    def _find_row(self, ws, label, col=1):
+        for row in ws.iter_rows():
+            if row[col - 1].value == label:
+                return row[0].row
+        pytest.fail(f"{label!r} not found")
+
+    def test_the_summary_offers_spare_rows(self, book):
+        assert self._find_row(book["Summary"], "ADD YOUR OWN LINES HERE")
+
+    def test_those_rows_are_blank_but_already_wired(self, book):
+        ws = book["Summary"]
+        start = self._find_row(ws, "ADD YOUR OWN LINES HERE") + 2
+        assert ws.cell(row=start, column=2).value is None, "not blank"
+        formula = ws.cell(row=start, column=4).value
+        assert isinstance(formula, str) and formula.startswith("=SUMIF")
+
+    def test_a_spare_row_searches_every_activity_sheet_of_its_drawing(self, book):
+        ws = book["Summary"]
+        start = self._find_row(ws, "ADD YOUR OWN LINES HERE") + 2
+        formula = ws.cell(row=start, column=4).value
+        sheets = {n for n in book.sheetnames if n.startswith("0106_")}
+        assert len([s for s in sheets if s in formula]) > 1, formula
+
+    def test_there_is_a_count_of_lines_with_no_summary_row(self, book):
+        ws = book["Summary"]
+        r = self._find_row(ws, "Unmatched detail lines", col=2)
+        formula = ws.cell(row=r, column=4).value
+        assert isinstance(formula, str) and "SUMPRODUCT" in formula
+        assert 'COUNTIF' in formula
+
+    def test_a_freshly_built_workbook_has_none_unmatched(self, book):
+        """Evaluated by hand: openpyxl stores formulas, Excel computes them."""
+        ws = book["Summary"]
+        check = self._find_row(ws, "Unmatched detail lines", col=2)
+        named = {ws.cell(row=r, column=2).value
+                 for r in range(7, check) if ws.cell(row=r, column=2).value}
+        for sheet in book.sheetnames:
+            if "_" not in sheet or sheet.endswith("Drawing items"):
+                continue
+            unmatched = [book[sheet].cell(row=r, column=2).value
+                         for r in range(5, 801)
+                         if book[sheet].cell(row=r, column=2).value
+                         and book[sheet].cell(row=r, column=2).value not in named]
+            assert not unmatched, f"{sheet}: {unmatched}"
+
+    def test_a_line_added_by_hand_is_counted(self, book):
+        """The check has to actually notice. Same arithmetic as the formula."""
+        ws = book["Summary"]
+        check = self._find_row(ws, "Unmatched detail lines", col=2)
+        named = {ws.cell(row=r, column=2).value
+                 for r in range(7, check) if ws.cell(row=r, column=2).value}
+        detail = book["0106_Concrete"]
+        added_at = max(r for r in range(5, 801)
+                       if detail.cell(row=r, column=2).value) + 1
+        detail.cell(row=added_at, column=2, value="RCC_M30 - Plinth for skid")
+        unmatched = [detail.cell(row=r, column=2).value for r in range(5, 801)
+                     if detail.cell(row=r, column=2).value
+                     and detail.cell(row=r, column=2).value not in named]
+        assert unmatched == ["RCC_M30 - Plinth for skid"]
+
+    def test_the_subtotal_block_is_never_counted_as_an_added_line(self, book):
+        """Its labels live in column A precisely so column B stays clean."""
+        ws = book["0106_Concrete"]
+        for row in ws.iter_rows():
+            if row[0].value and "TOTAL BY UNIT" in str(row[0].value):
+                for r in range(row[0].row, min(row[0].row + 8, ws.max_row + 1)):
+                    assert ws.cell(row=r, column=2).value in (None, "")
+                return
+        pytest.fail("subtotal block not found")

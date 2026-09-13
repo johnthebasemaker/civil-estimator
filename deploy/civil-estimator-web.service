@@ -1,0 +1,25 @@
+[Unit]
+Description=Civil Estimator web app
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=estimator
+Group=estimator
+EnvironmentFile=/etc/civil-estimator/civil-estimator.env
+WorkingDirectory=/opt/civil-estimator
+ExecStart=/opt/civil-estimator/venv/bin/streamlit run Home.py
+Restart=always
+RestartSec=5
+
+# The app writes only to its data directory and the output folder.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/civil-estimator /opt/civil-estimator/output
+ReadOnlyPaths=/etc/civil-estimator
+
+[Install]
+WantedBy=multi-user.target
