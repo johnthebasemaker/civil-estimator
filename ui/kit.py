@@ -174,7 +174,10 @@ THEME_CSS = """
 </style>
 """
 
-STEPS = ["Project", "Drawing → BOQ", "Input", "Review", "BOM", "Costing"]
+# "Project" used to lead this list and pointed at the entry script's setup
+# form. That page is gone — the app opens on Drawing → BOQ — so a chip for
+# it would be a step the user cannot take.
+STEPS = ["Drawing → BOQ", "Input", "Review", "BOM", "Costing"]
 
 
 def inject_theme() -> None:
@@ -402,6 +405,10 @@ def require_login() -> None:
     """
     inject_theme()
     if auth.is_authenticated(st.session_state):
+        # Every page carries this, not just the entry script: Streamlit renders
+        # the page list per page, so hiding it in one place would leave the
+        # forwarding entry visible everywhere else.
+        hide_entry_from_nav()
         return
 
     # Hide the page list while signed out. It is not a security control — each
@@ -464,3 +471,25 @@ def sidebar_account() -> None:
         if st.button("Sign out", use_container_width=True, key="_ce_signout"):
             auth.logout(st.session_state)
             st.rerun()
+
+
+def hide_entry_from_nav() -> None:
+    """Drop the entry script from the sidebar page list.
+
+    Streamlit always lists the script it was started from, and there is no
+    supported way to say "this one is not a page". Since that script now only
+    forwards to Drawing → BOQ, leaving it in the list gives the user a link
+    that flickers and returns them to where they already were.
+
+    Matched on the first item of the nav rather than on a generated class name,
+    because Streamlit's emotion classes change between releases and a selector
+    built on one would silently stop working on the next upgrade.
+    """
+    st.markdown(
+        """
+        <style>
+          [data-testid="stSidebarNav"] ul li:first-child { display: none; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )

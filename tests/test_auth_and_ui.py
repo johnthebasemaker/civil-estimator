@@ -215,7 +215,14 @@ class TestUIKit:
         from ui import kit
         html = kit._steps_html("Input")
         assert 'ce-step on">Input' in html
-        assert 'ce-step done">Project' in html
+        # Drawing → BOQ is the first step now that the setup page is gone.
+        assert 'ce-step done">Drawing' in html
+
+    def test_the_removed_setup_page_is_not_offered_as_a_step(self):
+        """A chip for a page that no longer exists is a step nobody can take."""
+        from ui import kit
+        assert "Project" not in kit.STEPS
+        assert kit.STEPS[0] == "Drawing → BOQ"
 
     def test_brand_text_is_escaped(self):
         from ui import kit

@@ -301,18 +301,30 @@ class TestDoubleCounting:
 # drawing's activity sheet. So a correction made where an engineer is actually
 # looking reaches the set total without anyone retyping it.
 # ---------------------------------------------------------------------------
+# The key cell's column differs by sheet — the Summary looks up on B, the
+# Location Based Report on C — so only its row is captured.
 SUMIF_RE = re.compile(
-    r"=SUMIF\('([^']+)'!\$([A-Z])\$(\d+):\$[A-Z]\$(\d+),\$B(\d+),"
+    r"=SUMIF\('([^']+)'!\$([A-Z])\$(\d+):\$[A-Z]\$(\d+),\$[A-Z](\d+),"
     r"'([^']+)'!\$([A-Z])\$\d+:\$[A-Z]\$\d+\)")
 
 
 def _sumifs(ws):
+    """Every cross-sheet SUMIF on a sheet.
+
+    Same-sheet totals — the per-unit subtotals, which look like
+    `=SUMIF($D$8:$D$9,$D10,$E$8:$E$9)` — are skipped. They have no sheet to
+    point at, so they are not what a link check is about.
+    """
     for row in ws.iter_rows():
         for cell in row:
-            if isinstance(cell.value, str) and cell.value.startswith("=SUMIF"):
-                m = SUMIF_RE.match(cell.value)
-                assert m, f"unparsable formula: {cell.value}"
-                yield cell, m
+            if not (isinstance(cell.value, str)
+                    and cell.value.startswith("=SUMIF(")):
+                continue
+            if "'" not in cell.value:
+                continue
+            m = SUMIF_RE.match(cell.value)
+            assert m, f"unparsable formula: {cell.value}"
+            yield cell, m
 
 
 class TestLinkedQuantities:
@@ -461,3 +473,136 @@ class TestLinesAddedByHand:
                     assert ws.cell(row=r, column=2).value in (None, "")
                 return
         pytest.fail("subtotal block not found")
+
+
+# ---------------------------------------------------------------------------
+# The Location Based Report. The Summary answers "how much of each item across
+# the set"; this sheet answers the one the tender asks first — how much is on
+# new ground, how much is inside a live plant, how much is making good what is
+# already there. Those carry different rates, so a blended total is the wrong
+# number however accurate the arithmetic.
+# ---------------------------------------------------------------------------
+def _classified_entries():
+    out = []
+    for drawing_no, classification, qty in (
+        ("MD-522-8110-EG-CV-LAD-0106", "Brown Field", 2),
+        ("MD-522-8110-EG-CV-LAD-0107", "Green Field", 5),
+        ("MD-522-8110-EG-CV-LAD-0115", "Repair", 3),
+    ):
+        out.append(SW.build_entry(drawing_no, _project(drawing_no, qty),
+                                  source_pdf=f"{drawing_no}.pdf",
+                                  classification=classification))
+    return out
+
+
+class TestLocationReport:
+    @pytest.fixture(scope="class")
+    def book(self, tmp_path_factory):
+        out = tmp_path_factory.mktemp("loc") / "SET.xlsx"
+        SW.write_set_workbook(_classified_entries(), out, project_name="Loc")
+        return load_workbook(out)
+
+    def test_the_sheet_is_added(self, book):
+        assert SW.LOCATION_SHEET in book.sheetnames
+
+    def test_the_existing_sheets_are_untouched(self, book):
+        """A new report must not reorganise the workbook around itself."""
+        assert book.sheetnames[0] == "Summary"
+        assert book.sheetnames[1] == "Drawings"
+        assert any(n.endswith("_Concrete") for n in book.sheetnames)
+
+    def test_every_classification_present_gets_its_own_band(self, book):
+        ws = book[SW.LOCATION_SHEET]
+        bands = {str(row[0].value) for row in ws.iter_rows()
+                 if row[0].value and str(row[0].value).isupper()}
+        assert {"BROWN FIELD", "GREEN FIELD", "REPAIR"} <= bands
+
+    def test_a_classification_nobody_used_is_not_invented(self, tmp_path):
+        entries = [e for e in _classified_entries()
+                   if e.classification != "Repair"]
+        out = tmp_path / "SET.xlsx"
+        SW.write_set_workbook(entries, out)
+        ws = load_workbook(out)[SW.LOCATION_SHEET]
+        bands = {str(row[0].value) for row in ws.iter_rows()
+                 if row[0].value and str(row[0].value).isupper()}
+        assert "REPAIR" not in bands
+
+    def test_drawings_are_listed_under_their_own_classification(self, book):
+        ws = book[SW.LOCATION_SHEET]
+        band, seen = None, {}
+        for row in ws.iter_rows():
+            first = row[0].value
+            if first and str(first).isupper() and str(first) != "SL. #":
+                band = str(first)
+            elif band and row[1].value and str(row[1].value).startswith("MD-"):
+                seen.setdefault(str(row[1].value), set()).add(band)
+        assert seen["MD-522-8110-EG-CV-LAD-0106"] == {"BROWN FIELD"}
+        assert seen["MD-522-8110-EG-CV-LAD-0107"] == {"GREEN FIELD"}
+        assert seen["MD-522-8110-EG-CV-LAD-0115"] == {"REPAIR"}
+
+    def test_quantities_are_linked_not_copied(self, book):
+        """Same methodology as the Summary: correct a detail sheet and this
+        report follows."""
+        ws = book[SW.LOCATION_SHEET]
+        linked = [c.value for row in ws.iter_rows() for c in row
+                  if isinstance(c.value, str) and c.value.startswith("=SUMIF(")]
+        assert linked, "the report is holding copies of the quantities"
+
+    def test_every_link_points_at_a_sheet_that_exists(self, book):
+        ws = book[SW.LOCATION_SHEET]
+        for cell, m in _sumifs(ws):
+            assert m.group(1) in book.sheetnames, f"{cell.coordinate} -> {m.group(1)}"
+
+    def test_each_component_carries_a_total(self, book):
+        ws = book[SW.LOCATION_SHEET]
+        totals = [str(c.value) for row in ws.iter_rows() for c in row
+                  if isinstance(c.value, str) and c.value.startswith("Total ")]
+        assert any("Structural Concrete (Brown Field)" in t for t in totals)
+        assert any("Formwork (Green Field)" in t for t in totals)
+
+    def test_a_total_is_a_formula_over_the_rows_above_it(self, book):
+        ws = book[SW.LOCATION_SHEET]
+        for row in ws.iter_rows():
+            label = row[2].value
+            if isinstance(label, str) and label.startswith("Total Structural"):
+                assert str(row[4].value).startswith("=SUMIF(")
+                return
+        pytest.fail("no concrete total found")
+
+    def test_a_total_never_reaches_past_its_own_group(self, book):
+        """The cursor moves as each total is written; a range that moved with
+        it would start summing the totals themselves."""
+        ws = book[SW.LOCATION_SHEET]
+        for row in ws.iter_rows():
+            label = row[2].value
+            if isinstance(label, str) and label.startswith("Total "):
+                m = re.search(r"\$E\$(\d+):\$E\$(\d+)", str(row[4].value))
+                assert m, row[4].value
+                assert int(m.group(2)) < row[4].row
+
+    def test_components_mixing_units_get_one_total_each(self, book):
+        """A component holding m3 and m2 must not add them together."""
+        ws = book[SW.LOCATION_SHEET]
+        for row in ws.iter_rows():
+            label = row[2].value
+            if isinstance(label, str) and label.startswith("Total "):
+                # Every total names the unit it applies to in column D.
+                assert row[3].value, f"{label} totals no particular unit"
+
+    def test_the_set_total_adds_the_component_totals(self, book):
+        ws = book[SW.LOCATION_SHEET]
+        found = [str(c.value) for row in ws.iter_rows() for c in row
+                 if isinstance(c.value, str) and c.value.startswith("Set total")]
+        assert found
+
+    def test_an_unfiled_drawing_is_shown_as_unfiled(self, tmp_path):
+        """Better a visible 'Unclassified' band than a drawing quietly filed
+        as new-build."""
+        entry = SW.build_entry("MD-522-8110-EG-CV-LAD-0106",
+                               _project("…-0106", 2), source_pdf="x.pdf")
+        out = tmp_path / "SET.xlsx"
+        SW.write_set_workbook([entry], out)
+        ws = load_workbook(out)[SW.LOCATION_SHEET]
+        bands = {str(row[0].value) for row in ws.iter_rows()
+                 if row[0].value and str(row[0].value).isupper()}
+        assert SW.UNFILED.upper() in bands

@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from core import classification as CLASS
 from core import set_workbook as SW                       # noqa: E402
 from core.derivation import (                             # noqa: E402
     apply_derived, default_rules, derive, rules_from_findings,
@@ -84,7 +85,10 @@ def main(argv: list[str] | None = None) -> int:
             project.drawing_no, project, source_pdf=result.source_pdf,
             derived_tags=derived_tags, placeholder_tags=placeholders,
             notes=notes, position_marks=result.position_marks,
-            discovery=discovery))
+            discovery=discovery,
+            # Set on the Extract page and kept on disk, so a workbook rebuilt
+            # from saved extractions is still filed by site condition.
+            classification=CLASS.get(result.source_pdf)))
         print(f"  {project.drawing_no:<32} "
               f"peds={len(project.pedestals)} slabs={len(project.grade_slabs)} "
               f"marks={len(result.position_marks)} read={n_items}")

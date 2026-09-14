@@ -15,3 +15,21 @@ output/
 data/jobs.db
 data/jobs.db-wal
 data/jobs.db-shm
+
+# ---------------------------------------------------------------------------
+# Client material. Drawings are Maaden's, not ours, and a repository is the
+# wrong place for them — they are large, they are confidential, and the tool is
+# supposed to run against whatever set you point it at. `Drawings/` was removed
+# from GitHub by hand; this keeps it from coming back.
+# ---------------------------------------------------------------------------
+Drawings/
+drawings/
+*.pdf
+!docs/**/*.pdf
+
+# Saved project state and extraction results, all regenerated from a drawing.
+output/projects/
+output/cache/
+output/uploads/
+output/classifications.json
+*_extraction.json

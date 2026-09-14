@@ -681,3 +681,99 @@ treated rather than by how bad it is:
 
 **Assumed** is the row to watch. It is the only class that looks exactly like
 every other number in the bill.
+
+## The app opens on the drawing
+
+The entry script used to be a project-setup screen: typed fields for the
+project name, drawing number, revision and date, beside a readiness panel. It
+was the first thing anyone saw and it was the wrong first thing. Nobody opens
+this tool to type a drawing number — they open it with a drawing, and the model
+reads the number off the title block faster than a person can type it.
+
+`Home.py` still exists, because Streamlit needs a script to start from and every
+launcher and systemd unit names it, but it now checks the password and hands
+straight over to **Drawing → BOQ**. It is hidden from the page list: a nav entry
+that bounces you elsewhere the moment you click it reads as a bug. The identity
+fields moved into that page's **Project details** box, and saving or loading a
+project sits in the session bar at the top of it.
+
+### Clear session
+
+One button, above everything, resetting all three areas of the page at once:
+
+| Area | What goes back to empty |
+|---|---|
+| 1 · Drawings | ticked drawings, the uploader's own file list, delete confirmations |
+| 2 · Extraction | the extraction, the review grids, derivation rules, the workbook link |
+| 3 · The BOQ | drawing and line selections, all filters, the search box, the built BOQ |
+
+Two things are deliberately kept. The **saved extractions** under `output/cache`
+stay, so a drawing cleared and queued again comes back in milliseconds rather
+than minutes of model time. The **uploaded PDFs** stay too, behind an opt-in
+tick, because a clear that silently deletes a morning's uploads is a button
+nobody presses twice.
+
+The finished queue rows *are* cleared, because section 3 is built from them —
+leaving them would refill the section the moment the page redrew, which looks
+exactly like the clear having failed.
+
+## Searching the line items
+
+Section 3 carries one search box across all four columns: drawing, source,
+group and description. Every word you type has to appear somewhere in the row,
+so `rebar 0107` narrows twice and word order does not matter. The drawing
+filter below it is narrowed by whatever the box matched, so typing part of a
+number and then picking from a short list beats scrolling a long one.
+
+## Green field, brown field, repair
+
+Each drawing carries a site classification, set from a dropdown on its row in
+section 1. It is an input rather than something read off the sheet, because
+nothing on a drawing reliably says which it is — and the three are tendered at
+different rates. A pedestal on open ground, the same pedestal inside a running
+plant, and making good one that already exists are the same cubic metre of
+concrete at three different prices.
+
+The choice is kept in `output/classifications.json`, keyed by file name rather
+than by path: the app copies an upload into `output/uploads/`, so one drawing
+routinely exists in two places, and a path key made those two copies two
+different drawings. Keeping it on disk rather than in the session is what lets
+`bin/rebuild_set.py` file a workbook correctly long after the browser tab has
+gone.
+
+### The Location Based Report
+
+A new sheet in `SET_BOQ.xlsx`, sitting behind Summary and Drawings. Every other
+sheet keeps exactly the content it had.
+
+```
+BROWN FIELD                                     4 drawing(s)
+  Earthwork
+    1  MD-522-8110-EG-CV-LAD-0106  Excavation …  m3   =SUMIF('0106_Earthwork'!…)
+    2  MD-522-8120-EG-CV-LAD-0101  Excavation …  m3   =SUMIF('8120-0101_Earth'!…)
+       Total Earthwork (Brown Field)             m3   =SUMIF($D$8:$D$11,…)
+  Structural Concrete
+    …
+GREEN FIELD                                     9 drawing(s)
+  …
+ALL CLASSIFICATIONS
+       Set total — m3                                 =$E$12+$E$28+…
+```
+
+Every component present is listed, not just pedestals and rebar, in the order a
+foundation is built. Items the drawing merely specifies come last, because they
+carry blank quantities more often than not and a report opening on forty rows
+of "area not stated" reads as though nothing was extracted.
+
+Nothing on the sheet is a copy. Each quantity is the same `SUMIF` into that
+drawing's own activity sheet that the Summary already uses, and each total is a
+formula over the rows above it — so a component holding both m³ and m² totals
+each honestly instead of adding them together.
+
+## Drawings are not in the repository
+
+`Drawings/`, every PDF, and the generated project state are all ignored now.
+They are the client's, they are large, and the tool is meant to run against
+whatever set you point it at. The folder was already removed on GitHub; the
+files were still tracked locally, so they have been untracked as well — they
+remain on disk, but the next commit will not put them back.

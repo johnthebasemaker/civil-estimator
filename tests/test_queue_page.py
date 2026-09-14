@@ -322,7 +322,8 @@ class TestClearingDoesNotLeaveStaleResults:
 
         at = _run()
         assert any("goes in the BOQ" in h.value for h in at.header)
-        next(b for b in at.button if b.label.startswith("🧹")).click().run()
+        next(b for b in at.button
+             if "Clear finished rows" in b.label).click().run()
         next(b for b in at.button if b.label == "Yes, clear them").click().run()
         assert not at.exception
         assert not JS.list_jobs(owner="shared")
@@ -330,7 +331,8 @@ class TestClearingDoesNotLeaveStaleResults:
 
     def test_the_ticks_are_forgotten_with_the_rows(self, finished_two):
         at = _run()
-        next(b for b in at.button if b.label.startswith("🧹")).click().run()
+        next(b for b in at.button
+             if "Clear finished rows" in b.label).click().run()
         next(b for b in at.button if b.label == "Yes, clear them").click().run()
         assert "drawing_picks" not in at.session_state
 

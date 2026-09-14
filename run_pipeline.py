@@ -37,6 +37,7 @@ from core.derivation import (
 )
 from core.excel_writer import write_workbook
 from core.filename import build_output_path, sanitise
+from core import classification as CLASS
 from core import gaps as GAPS
 from core import set_workbook as SW
 from core.models import Project
@@ -519,7 +520,8 @@ def main(argv: list[str] | None = None) -> int:
                            placeholder_tags=o.placeholder_tags, notes=o.notes,
                            position_marks=(o.result.position_marks
                                            if o.result else {}),
-                           discovery=(o.result.discovery if o.result else {}))
+                           discovery=(o.result.discovery if o.result else {}),
+                           classification=CLASS.get(o.pdf))
             for o in outcomes if o.ok and o.project]
         if entries:
             consolidated = SW.write_set_workbook(

@@ -79,6 +79,11 @@ class DrawingEntry:
     position_marks: dict[str, int] = field(default_factory=dict)
     # Whatever the sheet specifies in its own words — see extractors/discovery.
     discovery: dict = field(default_factory=dict)
+    # Which site condition this drawing belongs to: new ground, work inside a
+    # live plant, or making good what is already there. Set per drawing on the
+    # Extract page, because one submission routinely mixes all three and they
+    # are tendered at different rates.
+    classification: str = ""
 
     @property
     def discovered(self) -> list[dict]:
@@ -148,14 +153,16 @@ def build_entry(drawing_no: str, project: Project, *, source_pdf: str = "",
                 placeholder_tags: set[str] | None = None,
                 notes: list[str] | None = None,
                 position_marks: dict[str, int] | None = None,
-                discovery: dict | None = None) -> DrawingEntry:
+                discovery: dict | None = None,
+                classification: str = "") -> DrawingEntry:
     return DrawingEntry(drawing_no=drawing_no or "(no number)", project=project,
                         bom=build_bom(project), source_pdf=source_pdf,
                         derived_tags=set(derived_tags or ()),
                         placeholder_tags=set(placeholder_tags or ()),
                         notes=list(notes or ()),
                         position_marks=dict(position_marks or {}),
-                        discovery=dict(discovery or {}))
+                        discovery=dict(discovery or {}),
+                        classification=classification)
 
 
 def _row_key(line) -> tuple[str, str, str]:
@@ -194,6 +201,10 @@ def write_set_workbook(entries: list[DrawingEntry], out_path: str | Path, *,
     for entry in entries:
         _write_detail_sheets(wb, entry, codes[entry.drawing_no])
         _write_discovered_sheet(wb, entry, codes[entry.drawing_no])
+    # Written last so it can link to detail sheets that now exist, inserted at
+    # position 2 so it sits with the other set-wide views rather than behind
+    # forty per-drawing tabs. Every existing sheet keeps its content untouched.
+    _write_location_report(wb, entries, codes)
     wb.save(out_path)
     return out_path
 
@@ -919,3 +930,230 @@ def write_queue_report(jobs, out_path: str | Path, *, project_name: str = "") ->
     ws.freeze_panes = "A6"
     wb.save(out_path)
     return out_path
+
+
+# ----------------------------------------------------------------------
+# Location Based Report
+# ----------------------------------------------------------------------
+# The Summary answers "how much of each item across the set". This sheet
+# answers a different question that the tender asks first: how much of it is on
+# new ground, how much is inside a live plant, and how much is making good what
+# is already there. Those three carry different rates, so a total that blends
+# them is the wrong number however accurate the arithmetic.
+#
+# Every quantity here is a link, never a copy — the same SUMIF into the
+# drawing's own activity sheet that the Summary uses. Correct a net quantity on
+# `0107_Concrete` and it moves here too. The sub-totals are `=SUM` over the
+# rows immediately above them, so inserting a drawing row inside a group is
+# picked up without touching the formula.
+
+LOCATION_SHEET = "Location Based Report"
+CLASSIFICATION_ORDER = ("Brown Field", "Green Field", "Repair")
+UNFILED = "Unclassified"
+READ_COMPONENT = "Read from the drawing"
+
+# Components appear in the order a foundation is built, the same order the
+# detail tabs already use, with the items the drawing merely specifies last.
+# Those carry blank quantities more often than not, and a report that opens on
+# forty rows of "area not stated" reads as though nothing was extracted.
+_COMPONENT_ORDER = {cat: i for i, cat in enumerate(CATEGORY_TO_ACTIVITY)}
+
+
+def _component_rank(component: str) -> tuple[int, str]:
+    if component == READ_COMPONENT:
+        return (len(_COMPONENT_ORDER) + 1, component)
+    return (_COMPONENT_ORDER.get(component, len(_COMPONENT_ORDER)), component)
+
+
+def classification_order(entries: list[DrawingEntry]) -> list[str]:
+    """The classifications present, in a fixed order, unknown ones last."""
+    seen = {(e.classification or UNFILED) for e in entries}
+    known = [c for c in CLASSIFICATION_ORDER if c in seen]
+    return known + sorted(seen - set(CLASSIFICATION_ORDER))
+
+
+def _location_rows(entry: DrawingEntry, code: str) -> list[dict]:
+    """Every priced line and every read item on one drawing, as report rows."""
+    rows: list[dict] = []
+    for line in entry.bom.lines:
+        if line.category == "ROLLUP":
+            continue
+        activity = CATEGORY_TO_ACTIVITY.get(line.category, "")
+        sheet = _sheet_name(code, activity) if activity else ""
+        rows.append({
+            "component": line.category,
+            "description": line.item,
+            "uom": line.unit,
+            "sheet": sheet,
+            "desc_col": DETAIL_DESC_COL,
+            "value_col": DETAIL_GROSS_COL,
+            "first": DETAIL_FIRST_ROW,
+            "last": DETAIL_LAST_ROW,
+            "fallback": round(line.qty_gross, 3),
+            "note": _assumption(entry, line),
+        })
+    for item in entry.discovered:
+        rows.append({
+            "component": READ_COMPONENT,
+            "description": item.get("description", ""),
+            "uom": item.get("uom", ""),
+            "sheet": _sheet_name(code, "Drawing items"),
+            "desc_col": ITEMS_DESC_COL,
+            "value_col": ITEMS_QTY_COL,
+            "first": ITEMS_FIRST_ROW,
+            "last": ITEMS_LAST_ROW,
+            "fallback": item.get("qty"),
+            "note": item.get("basis", ""),
+        })
+    return rows
+
+
+def _write_location_report(wb: Workbook, entries: list[DrawingEntry],
+                           codes: dict[str, str]) -> None:
+    """Quantities grouped by site condition, then by component, then by drawing."""
+    ws = wb.create_sheet(LOCATION_SHEET, 2)      # behind Summary and Drawings
+
+    ws["A1"] = "LOCATION BASED REPORT"
+    ws["A1"].font = TITLE_FONT
+    ws["A2"] = ("Grouped by the site classification set against each drawing on "
+                "the Extract page, then by component, then by drawing.")
+    ws["A2"].alignment = LEFT
+    ws.merge_cells("A2:F2")
+    ws["A3"] = ("Every quantity is a live link into that drawing's own activity "
+                "sheet, and every total is a formula over the rows above it. "
+                "Correct a figure on a detail sheet and this report follows.")
+    ws["A3"].alignment = LEFT
+    ws.merge_cells("A3:F3")
+
+    headers = ["Sl. #", "Drawing No", "Description", "UoM", "Quantity",
+               "Notes / assumption"]
+    r = 5
+    _location_header(ws, r, headers)
+    r += 1
+
+    grand: dict[str, list[str]] = {}       # unit -> total cell references
+
+    for classification in classification_order(entries):
+        members = [e for e in entries
+                   if (e.classification or UNFILED) == classification]
+        rows_by_component: "OrderedDict[str, list[tuple[DrawingEntry, dict]]]" = \
+            OrderedDict()
+        for entry in members:
+            for row in _location_rows(entry, codes[entry.drawing_no]):
+                rows_by_component.setdefault(row["component"], []).append(
+                    (entry, row))
+        if not rows_by_component:
+            continue
+        rows_by_component = OrderedDict(
+            sorted(rows_by_component.items(),
+                   key=lambda kv: _component_rank(kv[0])))
+
+        # ---- classification band ----
+        cell = ws.cell(row=r, column=1, value=classification.upper())
+        cell.font = Font(bold=True, size=12, color="FFFFFF")
+        for col in range(1, len(headers) + 1):
+            ws.cell(row=r, column=col).fill = HEADER_FILL
+            ws.cell(row=r, column=col).border = BORDER
+        ws.cell(row=r, column=2, value=f"{len(members)} drawing(s)").font = Font(
+            bold=True, color="FFFFFF", size=10)
+        r += 1
+        class_first = r
+
+        for component, pairs in rows_by_component.items():
+            band = ws.cell(row=r, column=1, value=component)
+            band.font = Font(bold=True, color="1F4E78")
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=r, column=col).fill = GROUP_FILL
+                ws.cell(row=r, column=col).border = BORDER
+            r += 1
+            group_first = r
+
+            for i, (entry, row) in enumerate(pairs, start=1):
+                value = (
+                    _sumif(row["sheet"], f"$C{r}", desc_col=row["desc_col"],
+                           value_col=row["value_col"], first=row["first"],
+                           last=row["last"])
+                    if row["sheet"] and row["sheet"] in wb.sheetnames
+                    else row["fallback"])
+                values = [i, entry.drawing_no, row["description"], row["uom"],
+                          value, row["note"]]
+                for col, v in enumerate(values, start=1):
+                    c = ws.cell(row=r, column=col, value=v)
+                    c.border = BORDER
+                    c.alignment = (RIGHT if col == 5
+                                   else CENTER if col in (1, 4) else LEFT)
+                    if col == 5:
+                        c.number_format = "#,##0.000"
+                    if row["note"] and col in (5, 6):
+                        c.fill = ASSUMED_FILL
+                r += 1
+
+            # ---- one sub-total per unit in this component ----
+            # The data rows end here. Captured before the totals are written,
+            # because each total advances the cursor and a range that grew with
+            # it would start including the totals themselves.
+            group_last = r - 1
+            units: list[str] = []
+            for _, row in pairs:
+                if row["uom"] not in units:
+                    units.append(row["uom"])
+            for unit in units:
+                label = f"Total {component} ({classification})"
+                if len(units) > 1:
+                    label += f" — {unit}"
+                lab = ws.cell(row=r, column=3, value=label)
+                lab.font = Font(bold=True)
+                lab.alignment = LEFT
+                ws.cell(row=r, column=4, value=unit).alignment = CENTER
+                # SUMIF over the unit column, so a component that mixes m3 and
+                # m2 totals each honestly instead of adding them together.
+                total = ws.cell(row=r, column=5, value=(
+                    f"=SUMIF($D${group_first}:$D${group_last},$D{r},"
+                    f"$E${group_first}:$E${group_last})"))
+                total.number_format = "#,##0.000"
+                total.alignment = RIGHT
+                total.fill = TOTAL_FILL
+                total.font = Font(bold=True)
+                for col in range(1, len(headers) + 1):
+                    ws.cell(row=r, column=col).border = BORDER
+                grand.setdefault(unit, []).append(f"$E${r}")
+                r += 1
+            r += 1                                   # air between components
+
+        _ = class_first
+        r += 1                                       # air between classifications
+
+    # ---- across every classification ----
+    if grand:
+        cell = ws.cell(row=r, column=1, value="ALL CLASSIFICATIONS")
+        cell.font = Font(bold=True, size=12, color="FFFFFF")
+        for col in range(1, len(headers) + 1):
+            ws.cell(row=r, column=col).fill = HEADER_FILL
+            ws.cell(row=r, column=col).border = BORDER
+        r += 1
+        ws.cell(row=r, column=3, value=(
+            "Set totals by unit. These add the component sub-totals above, so "
+            "they move with any correction made on a detail sheet.")).alignment = LEFT
+        ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=6)
+        r += 1
+        for unit, refs in grand.items():
+            ws.cell(row=r, column=3, value=f"Set total — {unit}").font = Font(bold=True)
+            ws.cell(row=r, column=4, value=unit).alignment = CENTER
+            total = ws.cell(row=r, column=5, value="=" + "+".join(refs))
+            total.number_format = "#,##0.000"
+            total.alignment = RIGHT
+            total.fill = TOTAL_FILL
+            total.font = Font(bold=True)
+            for col in range(1, len(headers) + 1):
+                ws.cell(row=r, column=col).border = BORDER
+            r += 1
+
+    for col, width in {1: 7, 2: 30, 3: 46, 4: 8, 5: 15, 6: 44}.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.freeze_panes = "A6"
+
+
+def _location_header(ws, row: int, headers: list[str]) -> None:
+    for col, text in enumerate(headers, start=1):
+        c = ws.cell(row=row, column=col, value=text)
+        c.fill, c.font, c.alignment, c.border = HEADER_FILL, HEADER_FONT, CENTER, BORDER

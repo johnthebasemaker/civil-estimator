@@ -50,6 +50,7 @@ try:
         apply_derived, default_rules, derive, rules_from_findings,
     )
     from core import extract_cache as CACHE
+    from core import classification as CLASS
     from core import gaps as GAPS
     from core import jobstore as JS
     from core import set_workbook as SW
@@ -79,6 +80,167 @@ kit.page_header("Drawing → BOQ", project,
                 "download the workbook.", step="Drawing → BOQ")
 
 CONCRETE_GRADES = ["PCC_M15", "RCC_M25", "RCC_M30", "RCC_M40"]
+
+# Classification of the site condition a drawing belongs to. Asked per drawing
+# because one submission routinely mixes all three, and the quantities are
+# tendered separately: new-build ground, work inside a live plant, and making
+# good what is already there do not carry the same rates.
+CLASSIFICATIONS = list(CLASS.CHOICES)
+DEFAULT_CLASSIFICATION = CLASS.DEFAULT
+
+
+def classification_of(pdf_path) -> str:
+    """The classification a drawing is filed under.
+
+    Read from the session first so the dropdown responds immediately, then from
+    the file, which is what `bin/rebuild_set.py` sees long after the tab closes.
+    """
+    session = st.session_state.get(f"class::{pdf_path}")
+    if session in CLASSIFICATIONS:
+        return session
+    return CLASS.get(pdf_path)
+
+
+# ----------------------------------------------------------------------
+# Clearing the session
+# ----------------------------------------------------------------------
+# Every key the three areas of this page own. Listed explicitly rather than
+# wiped wholesale, because session state also holds the login, and a clear that
+# signs the user out is a clear nobody presses twice.
+_SESSION_PREFIXES = (
+    "pick::",        # which drawings are ticked in the library
+    "class::",       # per-drawing site classification
+    "fdwg::",        # which drawings are ticked for the combined BOQ
+)
+_SESSION_KEYS = (
+    # Area 1 — uploads and the drawing library
+    "_seen_uploads", "_confirm_delete", "_last_pdf",
+    # Area 2 — extraction, the review grids and the workbook it produced
+    "extraction", "x_rules", "q_rules", "q_profile", "q_force",
+    "ped_edit", "slab_edit", "last_workbook", "last_check_print",
+    "_confirm_clear_queue",
+    # Area 3 — selection, filters and the built BOQ
+    "drawing_picks", "line_picks", "sel_dwg", "sel_src", "sel_search",
+    "line_editor", "set_boq_path", "set_boq_built", "set_boq_lines",
+    "set_boq_drawings", "_confirm_clear_result",
+)
+
+
+def _clear_session(*, delete_uploads: bool = False) -> dict:
+    """Put all three areas back to how the page looks on a cold start.
+
+    The saved extractions under `output/cache` are deliberately left alone. They
+    are keyed by the drawing's content hash, so a cleared drawing re-queued
+    later comes back in milliseconds instead of minutes of model time — and a
+    button that quietly threw that away would be expensive to press by accident.
+    """
+    removed = {"keys": 0, "jobs": 0, "files": 0}
+
+    for key in list(st.session_state.keys()):
+        if key in _SESSION_KEYS or key.startswith(_SESSION_PREFIXES):
+            st.session_state.pop(key, None)
+            removed["keys"] += 1
+
+    # The project carries the title-block identity, which is part of the
+    # session rather than of any one drawing.
+    st.session_state.project = Project(project_name="", drawing_no="")
+
+    # Area 3 is built from finished queue rows, so leaving them would refill the
+    # section the moment the page redrew — the ghost rendering to avoid.
+    removed["jobs"] = JS.clear(owner=_owner())
+
+    if delete_uploads:
+        for pdf in sorted(UPLOAD_DIR.glob("*.pdf")):
+            try:
+                pdf.unlink()
+                removed["files"] += 1
+            except OSError:
+                continue
+            # The classification describes that drawing, so it goes with it.
+            # Left behind, it would quietly reattach to a different drawing
+            # uploaded later under the same file name.
+            CLASS.forget(pdf)
+
+    # The uploader keeps its own list of files, which no key of ours can reach.
+    # Bumping the nonce gives it a new identity, which is the only way to make
+    # it forget.
+    st.session_state["upload_nonce"] = st.session_state.get("upload_nonce", 0) + 1
+    return removed
+
+
+def _session_bar() -> None:
+    """Clear, save and load, above everything the three areas hold."""
+    left, right = st.columns([3, 2])
+    with left:
+        if st.session_state.get("_confirm_clear_session"):
+            st.warning(
+                "Clear the whole session? Ticked drawings, extracted figures, "
+                "filters and the built BOQ all go back to empty. The saved "
+                "extractions on disk are kept, so re-reading a drawing costs "
+                "nothing.", icon="🧹")
+            drop = st.checkbox(
+                f"Also delete the {len(list(UPLOAD_DIR.glob('*.pdf')))} uploaded "
+                f"PDF(s) from output/uploads",
+                key="clear_drop_uploads",
+                help="Off by default. This one cannot be undone.")
+            y, n = st.columns(2)
+            if y.button("Yes, clear the session", type="primary",
+                        use_container_width=True, key="clear_session_yes"):
+                report = _clear_session(delete_uploads=drop)
+                st.session_state.pop("_confirm_clear_session", None)
+                st.session_state["_cleared_report"] = report
+                SC.rerun()
+            if n.button("Keep everything", use_container_width=True,
+                        key="clear_session_no"):
+                st.session_state.pop("_confirm_clear_session", None)
+                SC.rerun()
+        else:
+            if st.button("🧹 Clear session", type="primary",
+                         use_container_width=True, key="clear_session"):
+                st.session_state["_confirm_clear_session"] = True
+                SC.rerun()
+            st.caption("Resets the drawing list, the extracted figures and the "
+                       "filters below, all three at once.")
+
+    with right:
+        with st.expander("Save or load this project", expanded=False):
+            PROJECT_DIR = OUTPUT_DIR / "projects"
+            PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+            if st.button("💾 Save project to JSON", use_container_width=True,
+                         key="save_project"):
+                if not project.drawing_no:
+                    st.error("Set a drawing number below before saving.")
+                else:
+                    from core.filename import sanitise
+                    fpath = PROJECT_DIR / (
+                        f"{sanitise(project.drawing_no)}_"
+                        f"{datetime.now().strftime('%Y%m%d_%H%M')}.json")
+                    fpath.write_text(project.model_dump_json(indent=2))
+                    st.success(f"Saved → `{fpath}`")
+            saved = sorted(PROJECT_DIR.glob("*.json"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            if saved:
+                sel = st.selectbox("Load a saved project",
+                                   ["— select —"] + [p.name for p in saved],
+                                   key="load_project_pick")
+                if sel != "— select —" and st.button(
+                        "📂 Load", use_container_width=True, key="load_project"):
+                    st.session_state.project = Project(
+                        **json.loads((PROJECT_DIR / sel).read_text()))
+                    SC.rerun()
+            else:
+                st.caption("No saved projects yet.")
+
+    report = st.session_state.pop("_cleared_report", None)
+    if report:
+        parts = [f"{report['keys']} setting(s)"]
+        if report["jobs"]:
+            parts.append(f"{report['jobs']} queue row(s)")
+        if report["files"]:
+            parts.append(f"{report['files']} uploaded file(s)")
+        st.success("Session cleared — " + ", ".join(parts) + ".", icon="✅")
+    st.divider()
+
 
 
 # ======================================================================
@@ -343,7 +505,8 @@ def _entries_from_queue(owner: str, rules) -> "OrderedDict":
             proj.drawing_no, proj, source_pdf=job.drawing_path,
             derived_tags=derived_tags, placeholder_tags=placeholders,
             notes=notes, position_marks=result.position_marks,
-            discovery=result.discovery)
+            discovery=result.discovery,
+            classification=classification_of(job.path))
         out[proj.drawing_no] = {"entry": entry, "job": job, "result": result,
                                 "derived": items}
     return out
@@ -371,6 +534,12 @@ def _line_rows(entries) -> list[dict]:
                 "UoM": item["uom"], "Qty": item.get("qty"),
             })
     return rows
+
+
+# The matcher lives in tests/helpers_search.py rather than here: this file is a
+# Streamlit script, and importing it to test one function would execute the
+# whole page.
+from tests.helpers_search import search_rows as _search_rows      # noqa: E402
 
 
 def _apply_selection(entries, chosen: set[str]) -> list:
@@ -458,14 +627,35 @@ def _results_panel() -> None:
                f"{len(all_entries)} extracted drawing(s). Untick anything that "
                f"does not belong in this bill.")
 
+    # One box across all four fields. With a hundred-odd lines from a dozen
+    # drawings, scrolling a multiselect to find "epoxy" is slower than typing
+    # it, and an estimator looking for one item knows a word from it long
+    # before they know which drawing it came from.
+    search = st.text_input(
+        "Search", key="sel_search", placeholder="Search drawing, source, "
+        "group or description — e.g. 0107, rebar, epoxy, pedestal",
+        help="Matches any of the four columns. Every word you type has to "
+             "appear somewhere in the row, so 'rebar 0107' narrows twice.")
+
     f1, f2, f3, f4 = st.columns([2, 2, 1, 1])
-    which = f1.multiselect("Filter by drawing", sorted(entries), default=[],
-                           key="sel_dwg")
+    matching_drawings = _search_rows(rows, search)
+    options = sorted({r["Drawing"] for r in matching_drawings}) or sorted(entries)
+    which = f1.multiselect("Filter by drawing", options, default=[],
+                           key="sel_dwg",
+                           help="Narrowed by the search box above, so typing "
+                                "part of a number then picking from this list "
+                                "is two steps rather than a long scroll.")
     kinds = f2.multiselect("Filter by source", ["BOQ", "Read from drawing"],
                            default=[], key="sel_src")
-    visible = [r for r in rows
+    visible = [r for r in matching_drawings
                if (not which or r["Drawing"] in which)
                and (not kinds or r["Source"] in kinds)]
+
+    if search and not visible:
+        st.info(f"Nothing matches “{search}”. Clear the box to see all "
+                f"{len(rows)} line(s) again.")
+    elif search:
+        st.caption(f"{len(visible)} of {len(rows)} line(s) match “{search}”.")
 
     picks: dict = st.session_state.setdefault("line_picks", {})
     for row in rows:
@@ -571,12 +761,18 @@ def _download_panel() -> None:
             "there and the Summary and the set total follow.", icon="🔗")
 
 
+_session_bar()
+
 st.header("1 · Drawings")
 
+# The uploader holds its own list of files that no session key can reach, so a
+# cleared session gives it a new identity instead. Without this, Clear left the
+# previously uploaded names sitting in the drop zone.
 uploads = st.file_uploader(
     "Upload drawing PDFs", type=["pdf"], accept_multiple_files=True,
+    key=f"uploader::{st.session_state.get('upload_nonce', 0)}",
     help="Saved to output/uploads/. Upload as many as you like; tick the ones "
-         "to work on.")
+         "to work on, and set each one's site classification.")
 
 # Streamlit hands back the uploader's whole file list on *every* rerun, not just
 # the run where the files arrived. Acting on that list unconditionally meant
@@ -638,11 +834,25 @@ for path in library:
     in_uploads = UPLOAD_DIR.resolve() in path.resolve().parents
     where = "uploaded" if in_uploads else "project root"
     label = path.name if _name_counts[path.name] == 1 else f"{path.name}  ·  {where}"
-    c1, c2, c3 = st.columns([6, 1.4, 1.4])
+    c1, c2, c3 = st.columns([5, 2.2, 1.2])
     with c1:
         ticked = st.checkbox(label, key=key)
-    c2.caption(f"{path.stat().st_size / 1024 / 1024:.1f} MB")
-    c3.caption(where)
+        st.caption(f"{path.stat().st_size / 1024 / 1024:.1f} MB · {where}")
+    with c2:
+        # Asked per drawing, not per submission: one package routinely mixes
+        # new ground, work inside a live plant, and making good what is there,
+        # and those three are tendered at different rates.
+        chosen = st.selectbox(
+            "Site classification", CLASSIFICATIONS,
+            index=CLASSIFICATIONS.index(classification_of(path)),
+            key=f"class::{path}", label_visibility="collapsed",
+            help="Groups this drawing in the Location Based Report sheet of "
+                 "the workbook.")
+        # Written through on every run rather than on change: the store is the
+        # only copy that survives the tab, and a value the user can see in the
+        # dropdown but that never reached disk is the worst of both.
+        if chosen != CLASS.get(path):
+            CLASS.set_for(path, chosen)
     if ticked:
         selected.append(path)
 
