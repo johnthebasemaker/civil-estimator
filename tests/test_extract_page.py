@@ -26,7 +26,9 @@ ROOT = Path(__file__).resolve().parent.parent
 from ui.auth import SESSION_KEY as AUTH_KEY
 
 PAGE = str(ROOT / "pages" / "0_Extract.py")
-SAMPLE_PDF = ROOT / "MD-522-8110-EG-CV-LAD-0107_C01.pdf"
+from tests.sample_drawing import sample_pdf
+
+SAMPLE_PDF = sample_pdf()
 
 TRUTH = {"P1": (600, 500, 2), "P2": (500, 500, 20), "P3": (350, 350, 11),
          "P6": (450, 450, 6), "P7": (500, 500, 4)}
