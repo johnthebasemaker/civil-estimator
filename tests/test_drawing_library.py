@@ -18,7 +18,9 @@ from ui.auth import SESSION_KEY as AUTH_KEY
 ROOT = Path(__file__).resolve().parent.parent
 PAGE = str(ROOT / "pages" / "0_Extract.py")
 UPLOAD_DIR = ROOT / "output" / "uploads"
-SAMPLE = ROOT / "MD-522-8110-EG-CV-LAD-0107_C01.pdf"
+from tests.sample_drawing import sample_pdf
+
+SAMPLE = sample_pdf()
 
 pytestmark = pytest.mark.skipif(not SAMPLE.exists(), reason="sample drawing missing")
 

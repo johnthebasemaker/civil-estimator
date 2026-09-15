@@ -27,7 +27,9 @@ from extractors.verification import (
 from extractors.pdf_to_image import open_page
 
 ROOT = Path(__file__).resolve().parent.parent
-SAMPLE_PDF = ROOT / "MD-522-8110-EG-CV-LAD-0107_C01.pdf"
+from tests.sample_drawing import sample_pdf
+
+SAMPLE_PDF = sample_pdf()
 
 
 # ================= grid =================
