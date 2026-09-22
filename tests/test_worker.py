@@ -30,6 +30,11 @@ pytestmark = pytest.mark.skipif(not TEXT_SHEET.exists(),
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("CIVIL_ESTIMATOR_JOBS_DB", str(tmp_path / "jobs.db"))
     monkeypatch.setenv("CIVIL_ESTIMATOR_CACHE_DIR", str(tmp_path / "cache"))
+    # The worker also writes a readable `<drawing>_extraction.json`, and
+    # `bin/rebuild_set.py` builds the set workbook from those. Left pointing at
+    # the real output/, the test below that seeds an *empty* reading of 0107
+    # overwrote the real 0107 copy on every run.
+    monkeypatch.setattr(W, "OUTPUT_DIR", tmp_path / "output")
     monkeypatch.chdir(ROOT)
     return tmp_path
 
