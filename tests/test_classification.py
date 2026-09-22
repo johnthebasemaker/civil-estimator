@@ -76,3 +76,19 @@ class TestDurability:
         C.set_for("A.pdf", C.REPAIR, store=store)
         C.forget("A.pdf", store=store)
         assert C.get("A.pdf", store=store) == C.DEFAULT
+
+
+class TestTheStoreCanMove:
+    """A server keeps it on a data volume; the test suite keeps it in a temp
+    folder, so running the tests never refiles someone's real drawings."""
+
+    def test_the_environment_variable_is_honoured(self, tmp_path, monkeypatch):
+        target = tmp_path / "elsewhere.json"
+        monkeypatch.setenv(C.STORE_ENV, str(target))
+        C.set_for("Drawings/A.pdf", C.REPAIR)
+        assert target.exists()
+        assert C.get("Drawings/A.pdf") == C.REPAIR
+
+    def test_the_suite_never_writes_the_real_store(self):
+        assert C.store_path() != C.STORE, \
+            "tests/conftest.py should point every test at its own store"

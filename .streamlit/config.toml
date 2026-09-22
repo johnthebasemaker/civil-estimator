@@ -9,3 +9,14 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+[client]
+# The people opening this app are estimators and managers, often through a
+# shared link. Streamlit's developer items — the Deploy button above all — are
+# noise to them and an invitation to click something that is not theirs.
+toolbarMode = "viewer"
+# An unexpected crash no longer prints its raw error message in the browser —
+# that text can carry file paths and figures. Streamlit 1.39 still shows the
+# stack frames under a generic notice; the full error goes to the app's log
+# (./bin/ce logs). Set this to true on a development machine for full detail.
+showErrorDetails = false

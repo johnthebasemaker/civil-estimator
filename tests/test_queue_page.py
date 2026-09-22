@@ -25,10 +25,26 @@ pytestmark = pytest.mark.skipif(not DRAWINGS.is_dir(),
 
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
-    """A queue and cache of this test's own, so runs cannot see each other."""
+    """A queue, cache and uploads folder of this test's own, so runs cannot
+    see each other — or whatever happens to be in the real uploads folder."""
     monkeypatch.setenv("CIVIL_ESTIMATOR_JOBS_DB", str(tmp_path / "jobs.db"))
     monkeypatch.setenv("CIVIL_ESTIMATOR_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("CIVIL_ESTIMATOR_UPLOAD_DIR", str(tmp_path / "uploads"))
     return tmp_path
+
+
+def _age_the_queue(sandbox, seconds: float = 60.0) -> None:
+    """Make every queued job look as if it has been waiting a while.
+
+    The page gives a new job a few seconds' grace before blaming a missing
+    worker — the worker polls every two seconds, so a warning the instant a job
+    is queued would flash red on every healthy click.
+    """
+    import sqlite3
+
+    with sqlite3.connect(sandbox / "jobs.db") as conn:
+        conn.execute("UPDATE jobs SET created_at = created_at - ? "
+                     "WHERE state = 'queued'", (seconds,))
 
 
 def _run(timeout: int = 300) -> "AppTest":
@@ -78,7 +94,17 @@ class TestQueuePanel:
     def test_a_queue_with_no_worker_says_how_to_start_one(self, sandbox):
         at = _tick_several(_run())
         next(b for b in at.button if b.label.startswith("➕")).click().run()
+        _age_the_queue(sandbox)
+        at.run()
+        assert any("Nothing is reading the queue" in w.value for w in at.warning)
         assert any("bin/worker.py" in c.value for c in at.code)
+        assert any("./bin/ce start" in c.value for c in at.code)
+
+    def test_a_just_queued_drawing_is_not_blamed_on_the_worker(self, sandbox):
+        at = _tick_several(_run())
+        next(b for b in at.button if b.label.startswith("➕")).click().run()
+        assert not any("Nothing is reading the queue" in w.value
+                       for w in at.warning)
 
 
 class TestControls:

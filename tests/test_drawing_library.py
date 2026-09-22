@@ -7,6 +7,7 @@ immediately and "Clear" was reverted before it could be seen.
 """
 from __future__ import annotations
 
+import os
 import shutil
 from pathlib import Path
 
@@ -17,7 +18,6 @@ from ui.auth import SESSION_KEY as AUTH_KEY
 
 ROOT = Path(__file__).resolve().parent.parent
 PAGE = str(ROOT / "pages" / "0_Extract.py")
-UPLOAD_DIR = ROOT / "output" / "uploads"
 from tests.sample_drawing import sample_pdf
 
 SAMPLE = sample_pdf()
@@ -26,18 +26,36 @@ pytestmark = pytest.mark.skipif(not SAMPLE.exists(), reason="sample drawing miss
 
 
 @pytest.fixture
-def library(tmp_path):
-    """Three small stand-in drawings in the uploads folder, removed after."""
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+def folders(tmp_path, monkeypatch):
+    """An uploads folder and a drawings folder of the test's own.
+
+    These tests used to copy their stand-ins into the real `output/uploads`,
+    which meant every run briefly put three fake drawings in front of anyone
+    using the app — and the tests' own counts depended on what else was there.
+    """
+    uploads, drawings = tmp_path / "uploads", tmp_path / "Drawings"
+    uploads.mkdir()
+    drawings.mkdir()
+    monkeypatch.setenv("CIVIL_ESTIMATOR_UPLOAD_DIR", str(uploads))
+    monkeypatch.setenv("CIVIL_ESTIMATOR_DRAWING_DIRS", str(drawings))
+    monkeypatch.setenv("CIVIL_ESTIMATOR_JOBS_DB", str(tmp_path / "jobs.db"))
+    monkeypatch.setenv("CIVIL_ESTIMATOR_CACHE_DIR", str(tmp_path / "cache"))
+    return uploads, drawings
+
+
+@pytest.fixture
+def library(folders):
+    """Three stand-in uploads, plus one drawing in the Drawings folder.
+
+    Real copies, not symlinks: the library lists each file once by identity, so
+    three links to one file would rightly show as one drawing.
+    """
+    uploads, drawings = folders
     names = [f"ZZ-TEST-{i}.pdf" for i in range(1, 4)]
-    made = []
     for name in names:
-        dest = UPLOAD_DIR / name
-        shutil.copy(SAMPLE, dest)
-        made.append(dest)
-    yield names
-    for path in made:
-        path.unlink(missing_ok=True)
+        shutil.copy(SAMPLE, uploads / name)
+    (drawings / "ZZ-KEPT.pdf").symlink_to(SAMPLE.resolve())
+    return names
 
 
 def _run():
@@ -115,25 +133,46 @@ class TestDeleteGuards:
         delete.click().run()
         assert any("permanently" in w.value for w in at.warning)
         # nothing removed until confirmed
-        assert all((UPLOAD_DIR / n).exists() for n in library)
+        uploads = Path(os.environ["CIVIL_ESTIMATOR_UPLOAD_DIR"])
+        assert all((uploads / n).exists() for n in library)
 
     def test_cancel_leaves_every_file_in_place(self, library):
         at = _run()
         next(b for b in at.button if b.label == "Select all").click().run()
         next(b for b in at.button if b.label.startswith("🗑")).click().run()
         next(b for b in at.button if b.label == "Cancel").click().run()
-        assert all((UPLOAD_DIR / n).exists() for n in library)
+        uploads = Path(os.environ["CIVIL_ESTIMATOR_UPLOAD_DIR"])
+        assert all((uploads / n).exists() for n in library)
 
-    def test_project_root_drawings_are_never_offered_for_deletion(self, library):
-        """This page manages its own uploads; quietly removing a file someone
-        put in the repo is not its business."""
+    def test_drawings_outside_uploads_are_never_offered_for_deletion(self, library):
+        """This page manages its own uploads; quietly removing a drawing someone
+        put in the Drawings folder or the project is not its business."""
         at = _run()
         next(b for b in at.button if b.label == "Select all").click().run()
+        assert any(c.label.startswith("ZZ-KEPT") and c.value for c in at.checkbox)
         delete = next(b for b in at.button if b.label.startswith("🗑"))
         count = int("".join(ch for ch in delete.label if ch.isdigit()))
-        in_uploads = len(list(UPLOAD_DIR.glob("*.pdf")))
-        assert count == in_uploads
+        assert count == len(library)               # the three uploads, not four
+        next(b for b in at.button if b.label.startswith("🗑")).click().run()
+        next(b for b in at.button if b.label == "Yes, delete").click().run()
+        drawings = Path(os.environ["CIVIL_ESTIMATOR_DRAWING_DIRS"])
+        assert (drawings / "ZZ-KEPT.pdf").exists()
         assert SAMPLE.exists()
+
+
+class TestTheDrawingsFolderIsListed:
+    """The set lives in Drawings/. The page used to look only at its uploads and
+    the project root, so with the uploads cleared it showed one drawing while
+    eleven sat beside it."""
+
+    def test_a_drawing_in_the_drawings_folder_is_offered(self, library):
+        at = _run()
+        assert any(c.label.startswith("ZZ-KEPT") for c in at.checkbox)
+
+    def test_it_says_where_each_drawing_lives(self, library):
+        at = _run()
+        captions = " ".join(c.value for c in at.caption)
+        assert "Drawings folder" in captions and "uploaded" in captions
 
 
 class TestBatchSwitch:

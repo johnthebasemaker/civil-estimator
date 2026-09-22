@@ -32,7 +32,7 @@ st.divider()
 
 # ---------- Guardrails ----------
 if not project.drawing_no:
-    st.error("Set **Drawing No.** on the home page before generating a BOM.")
+    st.error("This estimate has no drawing number yet. Set it under **Project details** on the Drawing → BOQ page, then come back.")
     st.stop()
 
 total_elements = (
@@ -44,7 +44,7 @@ total_elements = (
     len(project.rebar_bars) + len(project.formwork_loose)
 )
 if total_elements == 0:
-    st.warning("No elements entered. Go to **1_Input** to add at least one element.")
+    st.warning("No elements entered yet. Add at least one on the **Input** page.")
     st.stop()
 
 # ---------- Build BOM ----------

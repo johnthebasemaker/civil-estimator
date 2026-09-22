@@ -624,6 +624,45 @@ here is serving last revision's numbers without saying so.
 `bin/worker.py --once` drains the queue and exits, which is the form to use from
 cron or a test.
 
+### One drawing at a time goes through the queue too
+
+Ticking a single drawing used to read it inside the page — the same freeze the
+queue was built to end, and it never looked at the cache, so a drawing read last
+week showed "Local model unavailable" and a disabled button. Now the
+single-drawing view is cache first:
+
+* a drawing read before opens straight away from its saved extraction, with the
+  model switched off, and says so;
+* anything else is put on the queue with **Read this drawing**, and the page
+  shows its progress, a Stop button, and the result when the worker finishes.
+  You can close the tab meanwhile;
+* **Read again** re-reads it (after a reissue, or with another profile) and
+  replaces the saved result.
+
+A saved reading is only used while the file still has the bytes it was read
+from, so a reissue under the same name is never shown last revision's numbers.
+`tests/test_pages_never_run_the_model.py` fails if any page, UI module or the
+entry script calls the extractor or the model.
+
+Multi-page PDFs keep working: the page you pick is carried on the job, and page
+1 hashes exactly as it did before pages were tracked, so every existing saved
+extraction is still found.
+
+### Where the app finds drawings
+
+Three folders, in this order: the uploads folder, `Drawings/`, and the project
+root. Only uploads can be deleted from the page. When the same file name sits in
+two folders, both rows say which folder they are in.
+
+| Variable | Default | Moves |
+|---|---|---|
+| `CIVIL_ESTIMATOR_UPLOAD_DIR` | `output/uploads` | where uploads are written |
+| `CIVIL_ESTIMATOR_DRAWING_DIRS` | `Drawings:.` | the other folders searched, `:`-separated |
+| `CIVIL_ESTIMATOR_CLASSIFICATIONS` | `output/classifications.json` | the Green / Brown / Repair filing |
+
+The test suite points all three at its own temporary folders, so running it
+never adds files to your uploads or refiles your drawings.
+
 ### Choosing what goes in the bill
 
 Extraction and selection are separate steps on purpose. Reading is machine time

@@ -151,3 +151,29 @@ class TestProgress:
         JS.enqueue([TEXT_SHEET], owner="t")
         W.run(once=True)
         assert JS.list_jobs(owner="t")[0].progress_pct == 100
+
+
+class TestPages:
+    def test_the_job_page_reaches_the_extractor(self, env, monkeypatch):
+        seen = {}
+
+        def fake(pdf, page_number=0, **kwargs):
+            seen["page"] = page_number
+            from extractors.models import ExtractionResult
+            return ExtractionResult(source_pdf=str(pdf), model="m", profile="thorough")
+
+        monkeypatch.setattr(W.QV, "extract_from_pdf", fake)
+        monkeypatch.setattr(W, "OUTPUT_DIR", env / "output")
+        JS.enqueue([TEXT_SHEET], owner="t", page=0)
+        job = JS.claim_next("w")
+        job.page = 3                          # as if page 4 had been asked for
+        assert W.process(job, None) == "done"
+        assert seen["page"] == 3
+
+    def test_a_later_page_does_not_overwrite_page_one(self, env):
+        one = JS.Job(id="a", batch_id="b", owner="t", drawing_path="x/D.pdf",
+                     drawing_name="D.pdf")
+        two = JS.Job(id="c", batch_id="b", owner="t", drawing_path="x/D.pdf",
+                     drawing_name="D.pdf", page=1)
+        assert W.named_json(one).name == "D_extraction.json"
+        assert W.named_json(two).name == "D_p2_extraction.json"

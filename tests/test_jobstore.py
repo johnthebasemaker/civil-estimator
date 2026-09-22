@@ -210,3 +210,75 @@ class TestProgressReporting:
         drawing's model time."""
         JS.finish(two[0].id, from_cache=True, db_path=db)
         assert JS.summary(owner="a", db_path=db)["mean_seconds"] == 0.0
+
+
+class TestPages:
+    """A job reads one page of a PDF. Page 1 must keep the fingerprint it always
+    had, or every extraction saved before pages were tracked goes missing."""
+
+    def test_page_one_hashes_exactly_as_before(self):
+        import hashlib
+
+        digest = hashlib.sha256(b"thorough")
+        digest.update(SHEET.read_bytes())
+        assert JS.fingerprint(SHEET) == digest.hexdigest()[:32]
+        assert JS.fingerprint(SHEET, "thorough", 0) == JS.fingerprint(SHEET)
+
+    def test_another_page_is_another_reading(self):
+        assert JS.fingerprint(SHEET, "thorough", 1) != JS.fingerprint(SHEET)
+
+    def test_the_page_is_stored_on_the_job(self, db):
+        job = JS.enqueue([SHEET], owner="a", page=2, db_path=db)[0]
+        assert JS.get(job.id, db_path=db).page == 2
+        assert job.fingerprint == JS.fingerprint(SHEET, "thorough", 2)
+
+    def test_two_pages_of_one_drawing_are_two_jobs(self, db):
+        JS.enqueue([SHEET], owner="a", page=0, db_path=db)
+        JS.enqueue([SHEET], owner="a", page=1, db_path=db)
+        JS.enqueue([SHEET], owner="a", page=1, db_path=db)      # a duplicate
+        assert sorted(j.page for j in JS.list_jobs(db_path=db)) == [0, 1]
+
+
+class TestAnOlderDatabase:
+    """`CREATE TABLE IF NOT EXISTS` never alters a table that is already there,
+    so a queue made before pages existed has to be upgraded in place."""
+
+    OLD_SCHEMA = JS.SCHEMA.replace(
+        "    page            INTEGER NOT NULL DEFAULT 0,\n", "")
+
+    def test_the_page_column_is_added(self, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "old.db"
+        assert "page            INTEGER" not in self.OLD_SCHEMA
+        with sqlite3.connect(path) as conn:
+            conn.executescript(self.OLD_SCHEMA)
+            conn.execute(
+                "INSERT INTO jobs (id, batch_id, drawing_path, drawing_name, "
+                "created_at) VALUES ('j1', 'b', 'x.pdf', 'x.pdf', 1.0)")
+        job = JS.get("j1", db_path=path)
+        assert job is not None and job.page == 0
+
+    def test_upgrading_twice_is_harmless(self, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "old.db"
+        with sqlite3.connect(path) as conn:
+            conn.executescript(self.OLD_SCHEMA)
+        JS.list_jobs(db_path=path)
+        JS.list_jobs(db_path=path)
+
+
+class TestLatestPerDrawing:
+    def test_the_newest_job_wins(self, db):
+        first = JS.enqueue([SHEET], owner="a", db_path=db)[0]
+        JS.claim_next("w", db_path=db)
+        JS.fail(first.id, "boom", db_path=db)
+        second = JS.enqueue([SHEET], owner="a", db_path=db)[0]
+        latest = JS.latest_by_drawing(owner="a", db_path=db)
+        assert latest[(JS.drawing_key(SHEET), 0)].id == second.id
+
+    def test_a_relative_and_an_absolute_path_are_one_drawing(self, db):
+        JS.enqueue([SHEET.resolve()], owner="a", db_path=db)
+        latest = JS.latest_by_drawing(owner="a", db_path=db)
+        assert (JS.drawing_key(SHEET), 0) in latest

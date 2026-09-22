@@ -24,8 +24,17 @@ pytestmark = pytest.mark.skipif(not DRAWINGS.is_dir(),
 
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
+    """Queue, cache and uploads of the test's own — with one upload in it, so
+    "the uploads are kept" is checked against a folder that has something to
+    lose."""
     monkeypatch.setenv("CIVIL_ESTIMATOR_JOBS_DB", str(tmp_path / "jobs.db"))
     monkeypatch.setenv("CIVIL_ESTIMATOR_CACHE_DIR", str(tmp_path / "cache"))
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    sheet = DRAWINGS / "MD-522-8110-EG-CV-LAD-0102_C01.pdf"
+    if sheet.exists():
+        (uploads / "ZZ-UPLOADED.pdf").write_bytes(sheet.read_bytes())
+    monkeypatch.setenv("CIVIL_ESTIMATOR_UPLOAD_DIR", str(uploads))
     return tmp_path
 
 
@@ -133,15 +142,12 @@ class TestItClearsAllThreeAreas:
         assert len(list(cache.glob("*.json"))) == before
         assert before > 0
 
-    def test_the_uploaded_files_are_kept_unless_asked(self, dirty):
-        from pathlib import Path as P
-
-        upload_dir = ROOT / "output" / "uploads"
-        before = len(list(upload_dir.glob("*.pdf"))) if upload_dir.is_dir() else 0
+    def test_the_uploaded_files_are_kept_unless_asked(self, dirty, sandbox):
+        upload_dir = sandbox / "uploads"
+        before = len(list(upload_dir.glob("*.pdf")))
         self._clear(dirty)
-        after = len(list(upload_dir.glob("*.pdf"))) if upload_dir.is_dir() else 0
-        assert after == before
-        _ = P
+        assert len(list(upload_dir.glob("*.pdf"))) == before
+        assert before > 0
 
     def test_the_classification_survives_a_clear(self, dirty):
         """It describes the drawing, not the session. The drawings stay, so the

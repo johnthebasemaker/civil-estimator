@@ -30,6 +30,14 @@ environment file or nothing works:
 * `CIVIL_ESTIMATOR_SECRETS` — the password hash, kept outside the checkout so a
   deploy cannot overwrite it and an image cannot carry it.
 
+Three more move the app's own files onto the data volume. The worker does not
+read them, so they need only be set for the app:
+
+* `CIVIL_ESTIMATOR_UPLOAD_DIR` — where uploaded drawings are written.
+* `CIVIL_ESTIMATOR_DRAWING_DIRS` — the other folders searched for drawings,
+  separated by `:` (default `Drawings:.`).
+* `CIVIL_ESTIMATOR_CLASSIFICATIONS` — the Green / Brown / Repair filing.
+
 A worker that cannot see the app's queue looks exactly like a worker that is
 merely slow. If the queue fills and nothing moves, check these values first.
 
@@ -404,6 +412,9 @@ Very little, which is the point of having done the environment variables first:
 
 * `CIVIL_ESTIMATOR_JOBS_DB` and `CIVIL_ESTIMATOR_CACHE_DIR` already redirect the
   two stateful paths, and compose points both at the shared volume.
+* `CIVIL_ESTIMATOR_UPLOAD_DIR`, `CIVIL_ESTIMATOR_DRAWING_DIRS` and
+  `CIVIL_ESTIMATOR_CLASSIFICATIONS` do the same for uploads, the drawing set and
+  the site classifications.
 * `OLLAMA_HOST` already comes from the environment.
 * `bin/ce` stays the way you run it on a laptop; compose replaces it on the
   server. Neither knows about the other.
