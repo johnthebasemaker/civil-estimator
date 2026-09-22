@@ -15,3 +15,11 @@ import pytest
 def _own_classification_store(tmp_path, monkeypatch):
     monkeypatch.setenv("CIVIL_ESTIMATOR_CLASSIFICATIONS",
                        str(tmp_path / "classifications.json"))
+
+
+@pytest.fixture(autouse=True)
+def _tabs_fail_loudly(monkeypatch):
+    """In the app, a tab that raises is reported in words and the other tabs
+    carry on. In a test that would turn every bug into a quiet pass, so the
+    workspace re-raises instead (ui/workspace/common.py, `guarded`)."""
+    monkeypatch.setenv("CIVIL_ESTIMATOR_STRICT", "1")

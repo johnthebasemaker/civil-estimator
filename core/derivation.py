@@ -14,8 +14,8 @@ overridden. Every rule carries:
 
 Nothing here is enabled by default. A derived quantity is an assumption, and an
 assumption that reaches a priced BOQ without someone consciously accepting it is
-how a tender goes wrong. `pages/1_Input.py` shows each rule with its formula and
-a checkbox.
+how a tender goes wrong. The project estimate (`ui/workspace/boq_view.py`) shows
+each rule with its formula and a checkbox.
 
 Phase 1 modules are untouched; this is additive.
 """

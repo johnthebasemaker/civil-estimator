@@ -237,13 +237,17 @@ def enqueue(paths, *, owner: str = "", profile: str = "thorough",
             row = conn.execute(
                 "SELECT COALESCE(MAX(position), 0) AS p FROM jobs").fetchone()
             position = int(row["p"])
-            live = {(r["drawing_path"], r["page"]) for r in conn.execute(
+            # Compared by resolved path: `Drawings/x.pdf` and its absolute
+            # spelling are one drawing, and queueing it twice would spend the
+            # model's time proving the first reading right.
+            live = {(drawing_key(r["drawing_path"]), r["page"]) for r in conn.execute(
                 "SELECT drawing_path, page FROM jobs "
                 "WHERE owner = ? AND state IN (?, ?)", (owner, QUEUED, RUNNING))}
             for path in paths:
                 path = Path(path)
-                if (str(path), int(page)) in live:
+                if (drawing_key(path), int(page)) in live:
                     continue
+                live.add((drawing_key(path), int(page)))
                 position += 1
                 job = Job(id=uuid.uuid4().hex[:16], batch_id=batch_id, owner=owner,
                           drawing_path=str(path), drawing_name=path.name,

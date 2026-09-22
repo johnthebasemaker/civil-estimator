@@ -211,18 +211,19 @@ class TestUIKit:
         m = re.search(r"--ce-top:\s*(\d+)px", kit.THEME_CSS)
         assert m and int(m.group(1)) >= 48
 
-    def test_steps_mark_progress_through_the_workflow(self):
+    def test_the_header_no_longer_carries_page_step_chips(self):
+        """One chip per page made sense with five pages. The pages are tabs in
+        one workspace now, and a second row of navigation would be a copy of
+        the tab bar that did nothing when clicked."""
         from ui import kit
-        html = kit._steps_html("Input")
-        assert 'ce-step on">Input' in html
-        # Drawing → BOQ is the first step now that the setup page is gone.
-        assert 'ce-step done">Drawing' in html
+        assert not hasattr(kit, "STEPS")
+        assert "ce-steps" not in kit.THEME_CSS
 
-    def test_the_removed_setup_page_is_not_offered_as_a_step(self):
-        """A chip for a page that no longer exists is a step nobody can take."""
+    def test_every_badge_tone_has_a_colour(self):
+        from core import drawing_status as DS
         from ui import kit
-        assert "Project" not in kit.STEPS
-        assert kit.STEPS[0] == "Drawing → BOQ"
+        for tone in set(DS.TONES.values()):
+            assert f".ce-badge.{tone}" in kit.THEME_CSS, tone
 
     def test_brand_text_is_escaped(self):
         from ui import kit

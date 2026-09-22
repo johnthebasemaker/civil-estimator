@@ -282,3 +282,14 @@ class TestLatestPerDrawing:
         JS.enqueue([SHEET.resolve()], owner="a", db_path=db)
         latest = JS.latest_by_drawing(owner="a", db_path=db)
         assert (JS.drawing_key(SHEET), 0) in latest
+
+
+class TestOneDrawingOneLiveJob:
+    def test_two_spellings_of_one_path_are_one_job(self, db):
+        JS.enqueue([SHEET], owner="a", db_path=db)
+        JS.enqueue([SHEET.resolve()], owner="a", db_path=db)
+        assert len(JS.list_jobs(db_path=db)) == 1
+
+    def test_the_same_drawing_twice_in_one_call_is_one_job(self, db):
+        JS.enqueue([SHEET, SHEET.resolve(), SHEET], owner="a", db_path=db)
+        assert len(JS.list_jobs(db_path=db)) == 1

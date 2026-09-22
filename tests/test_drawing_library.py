@@ -40,6 +40,12 @@ def folders(tmp_path, monkeypatch):
     monkeypatch.setenv("CIVIL_ESTIMATOR_DRAWING_DIRS", str(drawings))
     monkeypatch.setenv("CIVIL_ESTIMATOR_JOBS_DB", str(tmp_path / "jobs.db"))
     monkeypatch.setenv("CIVIL_ESTIMATOR_CACHE_DIR", str(tmp_path / "cache"))
+    # Workbooks, check prints and SET_BOQ.xlsx go to the test's own folder.
+    # Before this, every run wrote them into the real output/ — overwriting
+    # the SET_BOQ.xlsx someone had just built.
+    from ui.workspace import common as _C
+    monkeypatch.setattr(_C, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(_C, "PROJECT_DIR", tmp_path / "output" / "projects")
     return uploads, drawings
 
 
@@ -175,21 +181,49 @@ class TestTheDrawingsFolderIsListed:
         assert "Drawings folder" in captions and "uploaded" in captions
 
 
-class TestBatchSwitch:
-    def test_several_ticked_drawings_switch_to_the_queue(self, library):
-        at = _run()
-        next(b for b in at.button if b.label == "Select all").click().run()
-        headers = [h.value for h in at.header]
-        assert any("Extraction queue" in h for h in headers)
+def _titles(at) -> list[str]:
+    return [h.value for h in at.header] + [s.value for s in at.subheader]
 
-    def test_one_ticked_drawing_keeps_the_single_flow(self, library):
+
+class TestSelectingIsNotOpening:
+    """Ticking used to change the page: one tick showed a drawing, a second
+    tick switched to the batch queue and threw the first drawing's review
+    away. A tick only selects now; Open is what shows a drawing."""
+
+    def test_one_tick_does_not_open_anything(self, library):
         at = _run()
         _boxes(at, library)[0].set_value(True).run()
-        headers = [h.value for h in at.header]
-        assert any("Sheet" in h for h in headers)
-        assert not any("Extraction queue" in h for h in headers)
+        assert "1 · Sheet" not in _titles(at)
+        assert any(b.label.startswith("➕ Add 1 drawing") for b in at.button)
+
+    def test_open_shows_the_drawing(self, library):
+        at = _run()
+        next(b for b in at.button if b.key == f"open::{_upload(library[0])}").click().run()
+        assert not at.exception
+        assert "1 · Sheet" in _titles(at)
+        assert any(b.label == "← All drawings" for b in at.button)
+
+    def test_back_returns_to_the_list_with_the_ticks_intact(self, library):
+        at = _run()
+        _boxes(at, library)[1].set_value(True).run()
+        next(b for b in at.button if b.key == f"open::{_upload(library[0])}").click().run()
+        next(b for b in at.button if b.label == "← All drawings").click().run()
+        assert "1 · Sheet" not in _titles(at)
+        assert [b.value for b in _boxes(at, library)] == [False, True, False]
+
+    def test_next_and_previous_walk_the_set(self, library):
+        at = _run()
+        next(b for b in at.button if b.key == f"open::{_upload(library[0])}").click().run()
+        assert next(b for b in at.button if b.label == "‹ Previous").disabled
+        next(b for b in at.button if b.label == "Next ›").click().run()
+        assert at.session_state["open_drawing"] == str(_upload(library[1]))
 
     def test_the_queue_offers_to_add_the_ticked_drawings(self, library):
         at = _run()
         next(b for b in at.button if b.label == "Select all").click().run()
-        assert any("Add" in b.label and "queue" in b.label for b in at.button)
+        assert any("Add" in b.label and "queue" in b.label and not b.disabled
+                   for b in at.button)
+
+
+def _upload(name: str) -> Path:
+    return Path(os.environ["CIVIL_ESTIMATOR_UPLOAD_DIR"]) / name
