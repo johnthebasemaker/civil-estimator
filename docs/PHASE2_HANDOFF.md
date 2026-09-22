@@ -1,5 +1,10 @@
 # Phase 2 Handoff — Qwen2.5-VL:7b Vision Extraction
 
+> **Historical record.** The pages this document names (`1_Input`, `2_Review`,
+> `3_BOM`, `4_Costing`) have since been folded into the one-page workspace —
+> see `ui/workspace/` and "The workspace" in the README. The design reasoning
+> below still holds; the file paths do not.
+
 **Audience:** Claude Code, working on the `civil-estimator` repo after Phase 1 (Steps 1–6) has been completed and merged.
 
 **Reader assumption:** You have full repo access and can read `core/models.py`, `pages/1_Input.py`, `pages/2_Review.py`. If you haven't, do that first.

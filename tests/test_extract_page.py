@@ -66,26 +66,35 @@ def _extraction() -> ExtractionResult:
     return r
 
 
-def _page_with_drawing(extraction=None, project=None):
-    """Drive the page the way a person does: pick a drawing, then extract.
+def _open(at, name: str) -> bool:
+    """Press a drawing's Open button, the way a person opens one."""
+    button = next((b for b in at.button
+                   if b.key and b.key.startswith("open::") and b.key.endswith(name)),
+                  None)
+    if button is None:
+        return False
+    button.click().run()
+    return True
 
-    Order matters. The page clears any stale extraction when the selected
-    drawing changes, so seeding `extraction` before the drawing is chosen would
-    be wiped — exactly as it should be.
+
+def _titles(at) -> list[str]:
+    """Headers and subheaders: the workspace titles its sections with both."""
+    return [h.value for h in at.header] + [s.value for s in at.subheader]
+
+
+def _page_with_drawing(extraction=None, project=None):
+    """Drive the page the way a person does: open a drawing, then read it.
+
+    Order matters. The page clears any stale extraction when the open drawing
+    changes, so seeding `extraction` before the drawing is opened would be wiped
+    — exactly as it should be.
     """
     at = AppTest.from_file(PAGE, default_timeout=300)
     at.session_state[AUTH_KEY] = True          # the page is behind a login gate
     if project is not None:
         at.session_state["project"] = project
     at.run()
-
-    # Tick the sample drawing. The label carries a location suffix when the same
-    # filename exists in both output/uploads and the project root, so match on
-    # the prefix rather than the bare name.
-    box = next((c for c in at.checkbox
-                if c.label.startswith(SAMPLE_PDF.name)), None)
-    if box is not None:
-        box.set_value(True).run()
+    _open(at, SAMPLE_PDF.name)
 
     if extraction is not None:
         at.session_state["extraction"] = extraction
@@ -114,6 +123,12 @@ def _sandboxed_queue(tmp_path, monkeypatch):
             (drawings / pdf.name).symlink_to(pdf.resolve())
     monkeypatch.setenv("CIVIL_ESTIMATOR_DRAWING_DIRS", str(drawings))
     monkeypatch.setenv("CIVIL_ESTIMATOR_UPLOAD_DIR", str(tmp_path / "uploads"))
+    # Workbooks, check prints and SET_BOQ.xlsx go to the test's own folder.
+    # Before this, every run wrote them into the real output/ — overwriting
+    # the SET_BOQ.xlsx someone had just built.
+    from ui.workspace import common as _C
+    monkeypatch.setattr(_C, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(_C, "PROJECT_DIR", tmp_path / "output" / "projects")
     return tmp_path
 
 
@@ -143,13 +158,13 @@ def _run_the_worker_once(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not SAMPLE_PDF.exists(), reason="sample drawing not in repo root")
 class TestExtractPageRenders:
-    def test_stops_cleanly_with_no_drawing_ticked(self):
+    def test_opens_on_the_drawing_list(self):
         at = AppTest.from_file(PAGE, default_timeout=120)
         at.session_state[AUTH_KEY] = True
         at.run()
         assert not at.exception
-        assert any("Tick a drawing" in i.value or "Upload a drawing" in i.value
-                   for i in at.info)
+        assert any(b.label == "Open" for b in at.button)
+        assert "1 · Sheet" not in _titles(at), "nothing is open until Open is pressed"
 
     def test_page_is_behind_the_login_gate(self):
         """Every page carries its own gate: Streamlit runs each as a separate
@@ -157,7 +172,8 @@ class TestExtractPageRenders:
         navigating straight here."""
         at = AppTest.from_file(PAGE, default_timeout=120).run()
         assert not at.exception
-        assert not any("1 · Drawings" in h.value for h in at.header)
+        assert not at.tabs, "the workspace must not render behind the gate"
+        assert any(t.label == "Password" for t in at.text_input)
 
     def test_renders_sheet_metrics_without_calling_the_model(self):
         at = _page_with_drawing()
@@ -170,9 +186,9 @@ class TestExtractPageRenders:
     def test_review_and_generate_render_once_extraction_exists(self):
         at = _page_with_drawing(_extraction(), Project(project_name="", drawing_no=""))
         assert not at.exception
-        headers = [h.value for h in at.header]
-        assert "4 · Review and correct" in headers
-        assert "5 · Generate BOQ" in headers
+        titles = _titles(at)
+        assert "3 · Review and correct" in titles
+        assert "4 · Generate this drawing's BOQ" in titles
         assert any("Generate BOQ Excel" in b.label for b in at.button)
 
     def test_pedestal_grid_is_prefilled_and_flags_placeholder_height(self):
@@ -358,11 +374,8 @@ class TestASheetThatNeedsNoModel:
         at = AppTest.from_file(PAGE, default_timeout=300)
         at.session_state[AUTH_KEY] = True
         at.run()
-        box = next((c for c in at.checkbox
-                    if c.label.startswith(TEXT_LAYER_PDF.name)), None)
-        if box is None:
+        if not _open(at, TEXT_LAYER_PDF.name):
             pytest.skip("drawing not in the library")
-        box.set_value(True).run()
         return at
 
     def test_the_page_says_no_model_calls_are_needed(self):
@@ -415,7 +428,7 @@ class TestADrawingReadBeforeOpensInstantly:
         assert not at.exception
         assert "extraction" in at.session_state
         assert any("saved reading" in s.value for s in at.success)
-        assert "4 · Review and correct" in [h.value for h in at.header]
+        assert "3 · Review and correct" in _titles(at)
 
     def test_nothing_is_queued_to_open_it(self, saved):
         from core import jobstore as JS
@@ -427,7 +440,7 @@ class TestADrawingReadBeforeOpensInstantly:
         at = _page_with_drawing()
         again = next(b for b in at.button if b.label.startswith("🔁"))
         assert "Read again" in again.label
-        assert again.type != "primary"
+        assert again.proto.type != "primary"
 
 
 @pytest.mark.skipif(not SAMPLE_PDF.exists(), reason="sample drawing not present")
@@ -447,7 +460,7 @@ class TestReadingGoesThroughTheQueue:
         at = _page_with_drawing()
         next(b for b in at.button if b.label == "🔍 Read this drawing").click().run()
         assert any(b.label == "⏹ Stop" for b in at.button)
-        assert "4 · Review and correct" not in [h.value for h in at.header]
+        assert "3 · Review and correct" not in _titles(at)
 
     def test_stop_takes_it_off_the_queue(self):
         from core import jobstore as JS

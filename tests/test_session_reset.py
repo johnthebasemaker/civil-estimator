@@ -35,6 +35,12 @@ def sandbox(tmp_path, monkeypatch):
     if sheet.exists():
         (uploads / "ZZ-UPLOADED.pdf").write_bytes(sheet.read_bytes())
     monkeypatch.setenv("CIVIL_ESTIMATOR_UPLOAD_DIR", str(uploads))
+    # Workbooks, check prints and SET_BOQ.xlsx go to the test's own folder.
+    # Before this, every run wrote them into the real output/ — overwriting
+    # the SET_BOQ.xlsx someone had just built.
+    from ui.workspace import common as _C
+    monkeypatch.setattr(_C, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(_C, "PROJECT_DIR", tmp_path / "output" / "projects")
     return tmp_path
 
 
@@ -132,7 +138,8 @@ class TestItClearsAllThreeAreas:
 
         at = self._clear(dirty)
         assert not JS.list_jobs(owner="shared")
-        assert not any("goes in the BOQ" in h.value for h in at.header)
+        titles = [h.value for h in at.header] + [s.value for s in at.subheader]
+        assert "Choose what goes in the BOQ" not in titles
 
     def test_the_saved_extractions_are_kept(self, dirty, sandbox):
         """Clearing costs no model time to undo."""
@@ -182,7 +189,7 @@ class TestSearch:
             {"Drawing": "MD-0106", "Source": "BOQ", "Group": "Epoxy Coating",
              "Description": "Epoxy to slab", "UoM": "m2"},
         ]
-        from tests.helpers_search import search_rows      # noqa: PLC0415
+        from core.search import search_rows      # noqa: PLC0415
 
         assert len(search_rows(rows, "rebar")) == 1
         assert len(search_rows(rows, "rebar 0107")) == 1
@@ -190,7 +197,7 @@ class TestSearch:
         assert len(search_rows(rows, "")) == 2
 
     def test_it_ignores_case_and_order(self):
-        from tests.helpers_search import search_rows
+        from core.search import search_rows
 
         rows = [{"Drawing": "MD-0107", "Source": "BOQ", "Group": "Epoxy Coating",
                  "Description": "Epoxy to slab", "UoM": "m2"}]

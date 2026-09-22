@@ -30,6 +30,12 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setenv("CIVIL_ESTIMATOR_JOBS_DB", str(tmp_path / "jobs.db"))
     monkeypatch.setenv("CIVIL_ESTIMATOR_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("CIVIL_ESTIMATOR_UPLOAD_DIR", str(tmp_path / "uploads"))
+    # Workbooks, check prints and SET_BOQ.xlsx go to the test's own folder.
+    # Before this, every run wrote them into the real output/ — overwriting
+    # the SET_BOQ.xlsx someone had just built.
+    from ui.workspace import common as _C
+    monkeypatch.setattr(_C, "OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(_C, "PROJECT_DIR", tmp_path / "output" / "projects")
     return tmp_path
 
 
@@ -59,11 +65,28 @@ def _tick_several(at):
     return at
 
 
+def _titles(at) -> list[str]:
+    """Headers and subheaders: the workspace titles its sections with both."""
+    return [h.value for h in at.header] + [s.value for s in at.subheader]
+
+
+def _add_button(at):
+    return next(b for b in at.button if b.label.startswith("➕"))
+
+
 class TestQueuePanel:
     def test_ticking_several_drawings_offers_the_queue(self, sandbox):
         at = _tick_several(_run())
         assert not at.exception
-        assert any("Extraction queue" in h.value for h in at.header)
+        ticked = sum(1 for c in at.checkbox
+                     if c.key and c.key.startswith("pick::") and c.value)
+        add = _add_button(at)
+        assert ticked > 1 and not add.disabled
+        assert f"Add {ticked} drawing(s)" in add.label
+
+    def test_nothing_ticked_means_nothing_to_add(self, sandbox):
+        at = _run()
+        assert _add_button(at).disabled
 
     def test_an_empty_queue_says_so_rather_than_looking_broken(self, sandbox):
         at = _tick_several(_run())
@@ -165,11 +188,13 @@ class TestResultsSurvive:
     def test_finished_work_shows_up_without_ticking_anything(self, finished):
         at = _run()
         assert not at.exception
-        assert any("Extraction queue" in h.value for h in at.header)
+        done = next(m for m in at.metric if m.label == "Done")
+        assert done.value == "1"
+        assert "Choose what goes in the BOQ" in _titles(at)
 
     def test_the_line_items_are_offered_for_selection(self, finished):
         at = _run()
-        assert any("goes in the BOQ" in h.value for h in at.header)
+        assert "Choose what goes in the BOQ" in _titles(at)
         assert at.get("arrow_data_frame"), "no selectable line-item table"
 
     def test_generating_the_boq_writes_a_workbook_and_keeps_the_link(self, finished):
@@ -233,11 +258,13 @@ class TestComingBackLater:
     def test_the_queue_is_shown_with_nothing_ticked(self, half_done):
         at = _run()
         assert not at.exception
-        assert any("Extraction queue" in h.value for h in at.header)
+        assert "Reading queue" in _titles(at)
+        assert {"Done", "Waiting"} <= {m.label for m in at.metric}
 
-    def test_it_still_says_how_to_start_a_new_one(self, half_done):
+    def test_it_still_offers_to_start_a_new_one(self, half_done):
         at = _run()
-        assert any("Tick a drawing" in i.value for i in at.info)
+        assert _add_button(at) is not None
+        assert any(b.label == "Select all" for b in at.button)
 
     def test_a_drawing_already_waiting_is_not_queued_a_second_time(
             self, half_done, sandbox):
@@ -347,13 +374,13 @@ class TestClearingDoesNotLeaveStaleResults:
         from core import jobstore as JS
 
         at = _run()
-        assert any("goes in the BOQ" in h.value for h in at.header)
+        assert "Choose what goes in the BOQ" in _titles(at)
         next(b for b in at.button
              if "Clear finished rows" in b.label).click().run()
         next(b for b in at.button if b.label == "Yes, clear them").click().run()
         assert not at.exception
         assert not JS.list_jobs(owner="shared")
-        assert not any("goes in the BOQ" in h.value for h in at.header)
+        assert "Choose what goes in the BOQ" not in _titles(at)
 
     def test_the_ticks_are_forgotten_with_the_rows(self, finished_two):
         at = _run()

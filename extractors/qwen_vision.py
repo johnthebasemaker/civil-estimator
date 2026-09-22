@@ -507,8 +507,9 @@ def _parse_title_block(payload: dict, result: ExtractionResult) -> TitleBlockExt
     filled = sum(bool(v) for v in (tb.drawing_no, tb.revision, tb.project_name, tb.date))
     tb.confidence = "high" if filled >= 3 else "medium" if filled >= 2 else "low"
     if not tb.drawing_no:
-        result.note("Title block: drawing number not read — set it manually "
-                    "before generating a BOQ (3_BOM refuses to run without it).")
+        result.note("Title block: drawing number not read — set it under "
+                    "Project details before generating a BOQ (a workbook needs "
+                    "one).")
     return tb
 
 
@@ -766,7 +767,8 @@ def _parse_grade_slab(payload: dict, result: ExtractionResult) -> GradeSlabExtra
 
     ok, reason = G.validate_grade_slab(row.get("length_mm"), row.get("width_mm"), thickness)
     if not ok:
-        result.note(f"Grade slab rejected ({reason}) — enter it manually in 1_Input.")
+        result.note(f"Grade slab rejected ({reason}) — enter it by hand under "
+                    f"BOQ → Project estimate.")
         return None
     if reason:
         result.note(f"Grade slab: {reason}")
@@ -941,8 +943,8 @@ def plan_merge(project: Project, result: ExtractionResult) -> MergePlan:
             f"UNVERIFIED: pedestal height is not on the callouts for "
             f"{', '.join(placeholders)}; merged at a placeholder "
             f"{PLACEHOLDER_HEIGHT_M:.3f} m. Concrete, formwork and rebar for "
-            f"these pedestals are WRONG until the real heights are entered in "
-            f"1_Input."
+            f"these pedestals are WRONG until the real heights are entered "
+            f"(the drawing's review grid, or BOQ → Project estimate)."
         )
 
     slab_tags = {s.tag.upper() for s in project.grade_slabs}
@@ -1049,5 +1051,5 @@ def extraction_warnings(result: ExtractionResult, plan: MergePlan | None = None)
         lines.append(" ".join(bits))
     lines.append("Tier 3 items (rebar bar-by-bar, joints, sumps, embedments, "
                  "excavation extents, concrete grades) are NOT extracted — "
-                 "enter them manually in 1_Input.")
+                 "enter them by hand under BOQ → Project estimate.")
     return lines

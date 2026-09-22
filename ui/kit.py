@@ -117,16 +117,36 @@ THEME_CSS = """
   .ce-chip.bad  { background:#FDECEC; color:#A11B1B; border-color:#F2C3C3; }
   .ce-chip.good { background:#E9F6EE; color:#1B6B3A; border-color:#BFE3CC; }
 
-  .ce-steps {
-      display:flex; gap:.4rem; flex-wrap:wrap;
-      padding:.45rem 0 .5rem 0; border-bottom:1px solid var(--ce-line);
+  /* ---- Drawing status badges ----
+     Four colour families so a list of twenty reads at a glance: grey for
+     nothing yet, blue for in motion, amber for a person's attention, green /
+     red for done and not done. */
+  .ce-badge {
+      display:inline-block; border-radius:999px; padding:.12rem .6rem;
+      font-size:.76rem; font-weight:700; white-space:nowrap; line-height:1.5;
+      border:1px solid transparent; vertical-align:middle;
   }
-  .ce-step {
-      font-size:.76rem; padding:.2rem .6rem; border-radius:6px;
-      background:#F3F5F8; color:#6B7280; border:1px solid var(--ce-line);
+  .ce-badge.idle { background:#F1F3F6; color:#5B6573; border-color:#DDE2E8; }
+  .ce-badge.busy { background:#EAF2FB; color:#1F4E78; border-color:#BFD5EC; }
+  .ce-badge.warn { background:#FFF4E5; color:#8A5300; border-color:#F0D5AC; }
+  .ce-badge.good { background:#E9F6EE; color:#1B6B3A; border-color:#BFE3CC; }
+  .ce-badge.bad  { background:#FDECEC; color:#A11B1B; border-color:#F2C3C3; }
+
+  /* ---- Workspace layout ----
+     Use the width. Streamlit's wide layout still keeps 80 px gutters and
+     96 px above the first element (measured); a review grid wants the room. */
+  [data-testid="stMainBlockContainer"] {
+      padding-left:2rem; padding-right:2rem; padding-top:4.25rem;
+      max-width:100%;
   }
-  .ce-step.on { background:var(--ce-navy); color:#fff; border-color:var(--ce-navy); }
-  .ce-step.done { background:#E9F6EE; color:#1B6B3A; border-color:#BFE3CC; }
+  /* The workspace tabs are the navigation now, so they read as navigation. */
+  [data-testid="stTabs"] button[role="tab"] p { font-size:1rem; font-weight:600; }
+  [data-testid="stTabs"] [data-testid="stTabs"] button[role="tab"] p {
+      font-size:.9rem; font-weight:600;
+  }
+  /* config.toml already hides Deploy (toolbarMode = "viewer"). This is the
+     fallback for a launch that does not read that file. */
+  [data-testid="stAppDeployButton"] { display:none !important; }
 
   /* ---- Freeze the header + step bar ----
      Streamlit's own toolbar is `position:fixed` and 60 px tall, and the page
@@ -174,12 +194,6 @@ THEME_CSS = """
 </style>
 """
 
-# "Project" used to lead this list and pointed at the entry script's setup
-# form. That page is gone — the app opens on Drawing → BOQ — so a chip for
-# it would be a step the user cannot take.
-STEPS = ["Drawing → BOQ", "Input", "Review", "BOM", "Costing"]
-
-
 def inject_theme() -> None:
     st.markdown(THEME_CSS, unsafe_allow_html=True)
 
@@ -190,12 +204,11 @@ def _esc(text: str) -> str:
 
 
 def page_header(title: str, project: Project | None = None,
-                subtitle: str = "", step: str | None = None) -> None:
+                subtitle: str = "") -> None:
     """Brand bar, page name and status chips — pinned to the top of the page.
 
-    Header and step bar are emitted as a single markdown block so the sticky
-    rule applies to them as one unit; splitting them would leave the step bar
-    scrolling out from under a pinned header.
+    There used to be a row of step chips under it, one per page. The pages are
+    tabs in one workspace now, and the tab bar is the navigation.
     """
     inject_theme()
     sidebar_logo()
@@ -215,7 +228,6 @@ def page_header(title: str, project: Project | None = None,
     logo = logo_data_uri()
     logo_html = (f'<img class="ce-logo" src="{logo}" alt="General Industries">'
                  if logo else "")
-    steps_html = _steps_html(step) if step else ""
 
     st.markdown(
         f'<div class="ce-sticky">'
@@ -227,7 +239,6 @@ def page_header(title: str, project: Project | None = None,
         f'    </div>'
         f'    <div class="ce-chips">{"".join(chips)}</div>'
         f'  </div>'
-        f'  {steps_html}'
         f'</div>',
         unsafe_allow_html=True)
 
@@ -264,23 +275,6 @@ def sidebar_logo() -> None:
         st.sidebar.markdown(
             f'<div class="ce-sidelogo"><img src="{uri}" '
             f'alt="General Industries"></div>', unsafe_allow_html=True)
-
-
-def _steps_html(current: str) -> str:
-    seen_current = False
-    out = []
-    for label in STEPS:
-        if label == current:
-            seen_current = True
-            cls = "on"
-        else:
-            cls = "done" if not seen_current else ""
-        out.append(f'<span class="ce-step {cls}">{_esc(label)}</span>')
-    return f'<div class="ce-steps">{"".join(out)}</div>'
-
-
-def render_steps(current: str) -> None:
-    st.markdown(_steps_html(current), unsafe_allow_html=True)
 
 
 # ---------- Completeness ----------
@@ -329,7 +323,8 @@ def assess(project: Project) -> Coverage:
                              + 0.25 * got_e / len(EXPECTED)))
 
     if not project.drawing_no:
-        cov.blockers.append("No drawing number — the BOM page will refuse to run.")
+        cov.blockers.append("No drawing number yet — open a drawing and set it "
+                            "under Project details. A workbook needs one.")
     ph = placeholder_heights(project)
     if ph:
         cov.blockers.append(

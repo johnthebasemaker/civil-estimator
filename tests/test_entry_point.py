@@ -68,7 +68,10 @@ class TestTheEntryScript:
                      "readiness_panel", "sidebar_summary"):
             assert gone not in called, f"{gone}() is still on the entry script"
 
-    def test_the_identity_fields_live_on_the_extract_page_now(self):
-        page = (ROOT / "pages" / "0_Extract.py").read_text()
-        assert "Project details" in page
-        assert "Save or load this project" in page
+    def test_the_identity_fields_live_in_the_workspace_now(self):
+        """The workspace page is a shell; its tabs are modules in ui/workspace."""
+        code = "\n".join(p.read_text() for p in
+                         [ROOT / "pages" / "0_Extract.py",
+                          *sorted((ROOT / "ui" / "workspace").glob("*.py"))])
+        assert "Project details" in code
+        assert "Save or load this project" in code

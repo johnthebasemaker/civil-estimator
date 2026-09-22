@@ -20,3 +20,6 @@ toolbarMode = "viewer"
 # stack frames under a generic notice; the full error goes to the app's log
 # (./bin/ce logs). Set this to true on a development machine for full detail.
 showErrorDetails = false
+# One page with four tabs: the tab bar is the navigation, so Streamlit's own
+# page list in the sidebar would only offer the entry script that forwards here.
+showSidebarNavigation = false

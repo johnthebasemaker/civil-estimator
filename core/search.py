@@ -1,8 +1,9 @@
-"""The Area 3 search rule, extracted so it can be tested without Streamlit.
+"""The line-item search rule for the combined BOQ.
 
-`pages/0_Extract.py` is a script, not a module — importing it outside a running
-app executes the whole page. The matcher is small and worth testing directly,
-so it lives here and the page imports it.
+It used to live in `tests/helpers_search.py`, imported by the page — production
+code reaching into the test folder, because the page was a script and the
+matcher had nowhere else to go. The workspace is modules now, so it lives with
+the rest of the logic that is tested without Streamlit.
 """
 from __future__ import annotations
 
