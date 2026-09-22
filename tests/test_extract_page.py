@@ -95,14 +95,50 @@ def _page_with_drawing(extraction=None, project=None):
 
 @pytest.fixture(autouse=True)
 def _sandboxed_queue(tmp_path, monkeypatch):
-    """A queue of this test's own.
+    """A queue, a cache and a drawing library of this test's own.
 
     Without this the page renders against whatever is in the developer's real
-    `data/jobs.db`, so the same test passes or fails depending on what someone
-    extracted this morning.
+    `data/jobs.db` and uploads folder, so the same test passes or fails
+    depending on what someone extracted — or deleted — this morning. That is
+    exactly how this file went red once the uploads folder was emptied.
+
+    The library holds symlinks to the real drawings: the page sees them as
+    ordinary files, and nothing is copied.
     """
     monkeypatch.setenv("CIVIL_ESTIMATOR_JOBS_DB", str(tmp_path / "jobs.db"))
     monkeypatch.setenv("CIVIL_ESTIMATOR_CACHE_DIR", str(tmp_path / "cache"))
+    drawings = tmp_path / "Drawings"
+    drawings.mkdir()
+    for pdf in (SAMPLE_PDF, ROOT / "Drawings" / "MD-522-8110-EG-CV-LAD-0101_C01.pdf"):
+        if pdf.exists():
+            (drawings / pdf.name).symlink_to(pdf.resolve())
+    monkeypatch.setenv("CIVIL_ESTIMATOR_DRAWING_DIRS", str(drawings))
+    monkeypatch.setenv("CIVIL_ESTIMATOR_UPLOAD_DIR", str(tmp_path / "uploads"))
+    return tmp_path
+
+
+def _load_worker():
+    """bin/ is a script directory, not a package, so load the worker by path."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("worker", ROOT / "bin" / "worker.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _run_the_worker_once(tmp_path, monkeypatch):
+    """What `bin/worker.py` does for one queued job, in-process.
+
+    Its human-readable JSON copy is redirected into the test's folder, so a test
+    run never overwrites the real `output/<drawing>_extraction.json`.
+    """
+    from core import jobstore as JS
+
+    W = _load_worker()
+    monkeypatch.setattr(W, "OUTPUT_DIR", tmp_path / "output")
+    job = JS.claim_next("test-worker")
+    assert job is not None, "nothing was queued"
+    return W.process(job, None), job
 
 
 @pytest.mark.skipif(not SAMPLE_PDF.exists(), reason="sample drawing not in repo root")
@@ -343,10 +379,153 @@ class TestASheetThatNeedsNoModel:
         button = next(b for b in at.button if b.label.startswith("🔍"))
         assert not button.disabled
 
-    def test_extracting_works_and_costs_no_model_time(self):
+    def test_extracting_works_and_costs_no_model_time(self, tmp_path, monkeypatch):
+        """The button queues the drawing; the worker reads it; the page picks
+        the result up. The page itself never runs the extractor — see
+        tests/test_pages_never_run_the_model.py."""
         at = self._page()
         next(b for b in at.button if b.label.startswith("🔍")).click().run()
+        assert not at.exception
+        assert "extraction" not in at.session_state, \
+            "the page must not read the drawing itself"
+
+        outcome, _ = _run_the_worker_once(tmp_path, monkeypatch)
+        assert outcome == "done"
+        at.run()
         assert not at.exception
         result = at.session_state["extraction"]
         assert result.used_text_layer
         assert result.montages_sent == 0
+
+
+@pytest.mark.skipif(not SAMPLE_PDF.exists(), reason="sample drawing not present")
+class TestADrawingReadBeforeOpensInstantly:
+    """The management case: a drawing somebody already read must come back from
+    the saved extraction, with the model switched off, and without queueing."""
+
+    @pytest.fixture
+    def saved(self):
+        from core import extract_cache as CACHE
+        from core import jobstore as JS
+
+        CACHE.store(JS.fingerprint(SAMPLE_PDF, "thorough"), _extraction())
+
+    def test_it_opens_without_the_model(self, saved):
+        at = _page_with_drawing()
+        assert not at.exception
+        assert "extraction" in at.session_state
+        assert any("saved reading" in s.value for s in at.success)
+        assert "4 · Review and correct" in [h.value for h in at.header]
+
+    def test_nothing_is_queued_to_open_it(self, saved):
+        from core import jobstore as JS
+
+        _page_with_drawing()
+        assert JS.list_jobs() == []
+
+    def test_reading_it_again_is_offered_but_not_forced(self, saved):
+        at = _page_with_drawing()
+        again = next(b for b in at.button if b.label.startswith("🔁"))
+        assert "Read again" in again.label
+        assert again.type != "primary"
+
+
+@pytest.mark.skipif(not SAMPLE_PDF.exists(), reason="sample drawing not present")
+class TestReadingGoesThroughTheQueue:
+    def test_the_button_queues_one_drawing(self):
+        from core import jobstore as JS
+
+        at = _page_with_drawing()
+        next(b for b in at.button if b.label == "🔍 Read this drawing").click().run()
+        assert not at.exception
+        jobs = JS.list_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].drawing_name == SAMPLE_PDF.name
+        assert jobs[0].page == 0 and jobs[0].profile == "thorough"
+
+    def test_while_it_waits_the_page_offers_a_stop_and_no_review(self):
+        at = _page_with_drawing()
+        next(b for b in at.button if b.label == "🔍 Read this drawing").click().run()
+        assert any(b.label == "⏹ Stop" for b in at.button)
+        assert "4 · Review and correct" not in [h.value for h in at.header]
+
+    def test_stop_takes_it_off_the_queue(self):
+        from core import jobstore as JS
+
+        at = _page_with_drawing()
+        next(b for b in at.button if b.label == "🔍 Read this drawing").click().run()
+        next(b for b in at.button if b.label == "⏹ Stop").click().run()
+        assert not at.exception
+        assert JS.list_jobs()[0].state == JS.CANCELLED
+
+    def test_the_finished_reading_is_picked_up(self):
+        from core import extract_cache as CACHE
+        from core import jobstore as JS
+
+        at = _page_with_drawing()
+        next(b for b in at.button if b.label == "🔍 Read this drawing").click().run()
+        job = JS.claim_next("test-worker")
+        CACHE.store(job.fingerprint, _extraction())
+        JS.finish(job.id)
+        at.run()
+        assert not at.exception
+        assert at.session_state["extraction"].title_block.drawing_no == \
+            "MD-522-8110-EG-CV-LAD-0107"
+        assert any("Read and saved" in s.value for s in at.success)
+
+
+@pytest.mark.skipif(not SAMPLE_PDF.exists(), reason="sample drawing not present")
+class TestAFailureIsSaidPlainly:
+    RAW = ("the vision model is unavailable: Cannot reach Ollama at "
+           "http://127.0.0.1:11434: <urlopen error [Errno 61] Connection refused>")
+
+    @pytest.fixture
+    def failed(self):
+        from core import jobstore as JS
+
+        at = _page_with_drawing()
+        next(b for b in at.button if b.label == "🔍 Read this drawing").click().run()
+        job = JS.claim_next("test-worker")
+        JS.fail(job.id, self.RAW)
+        at.run()
+        return at
+
+    def test_the_headline_is_in_words(self, failed):
+        headline = " ".join(e.value for e in failed.error)
+        assert "reading service was offline" in headline
+        assert "Errno" not in headline and "urlopen" not in headline
+
+    def test_the_raw_message_is_one_click_away(self, failed):
+        assert any(e.label == "Technical details" for e in failed.expander)
+        assert any(self.RAW in c.value for c in failed.code)
+
+    def test_it_offers_to_try_again(self, failed):
+        assert any(b.label == "🔍 Try reading it again" for b in failed.button)
+
+
+@pytest.mark.skipif(not SAMPLE_PDF.exists(), reason="sample drawing not present")
+class TestAReissuedDrawingIsNotShownTheOldReading:
+    """Same file name, new bytes: the old result belongs to the old drawing."""
+
+    def test_the_stale_result_is_not_loaded(self, tmp_path, monkeypatch):
+        from core import extract_cache as CACHE
+        from core import jobstore as JS
+
+        folder = tmp_path / "reissue"
+        folder.mkdir()
+        pdf = folder / SAMPLE_PDF.name
+        pdf.write_bytes(SAMPLE_PDF.read_bytes())
+        monkeypatch.setenv("CIVIL_ESTIMATOR_DRAWING_DIRS", str(folder))
+
+        job = JS.enqueue([pdf], owner="shared")[0]
+        JS.claim_next("test-worker")
+        CACHE.store(job.fingerprint, _extraction())
+        JS.finish(job.id)
+
+        with pdf.open("ab") as fh:                 # the reissue
+            fh.write(b"\n% revised\n")
+
+        at = _page_with_drawing()
+        assert not at.exception
+        assert "extraction" not in at.session_state
+        assert any(b.label == "🔍 Read this drawing" for b in at.button)

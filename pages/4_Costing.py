@@ -41,7 +41,7 @@ except Exception as e:
 
 costable = [l for l in bom.lines if l.category != "ROLLUP"]
 if not costable:
-    st.warning("No costable lines yet. Add elements on **1_Input** first.")
+    st.warning("Nothing to price yet. Add elements on the **Input** page first.")
     st.stop()
 
 # ---------- Load rates keyed by (category, unit) ----------
@@ -106,7 +106,7 @@ with c2:
     ])
     st.dataframe(cat_df, hide_index=True, use_container_width=True)
 
-st.info("💡 The Excel workbook (from **3_BOM**) includes a Costing sheet with these rates baked in.")
+st.info("💡 The Excel workbook from the **BOM** page includes a Costing sheet with these rates baked in.")
 
 kit.sidebar_summary(project)
 kit.sidebar_account()

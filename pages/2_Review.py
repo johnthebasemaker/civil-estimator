@@ -96,7 +96,7 @@ if bom.lines:
     if len(bom.lines) > 50:
         st.caption(f"…{len(bom.lines) - 50} more lines. Full list in the exported Excel.")
 else:
-    st.info("No elements entered yet. Go to **1_Input** to start.")
+    st.info("No elements entered yet. Start on the **Input** page.")
 
 st.divider()
 
@@ -107,7 +107,7 @@ if rollups:
     ru_df = pd.DataFrame([{"Item": l.item, "Qty": l.qty_gross, "Unit": l.unit} for l in rollups])
     st.dataframe(ru_df, hide_index=True, use_container_width=True)
 
-st.info("Proceed to **3_BOM** (Step 6) to download the Excel workbook.")
+st.info("Next: download the Excel workbook from the **BOM** page.")
 
 kit.sidebar_summary(project)
 kit.sidebar_account()

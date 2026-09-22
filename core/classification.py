@@ -22,9 +22,18 @@ problem long before it was ours.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 STORE = Path("output/classifications.json")
+# Like the queue and the cache, the store can live elsewhere: on a server's
+# data volume, or — the reason it exists — in a test's own folder, so running
+# the suite never refiles somebody's real drawings.
+STORE_ENV = "CIVIL_ESTIMATOR_CLASSIFICATIONS"
+
+
+def store_path() -> Path:
+    return Path(os.environ.get(STORE_ENV) or STORE)
 
 GREEN_FIELD = "Green Field"
 BROWN_FIELD = "Brown Field"
@@ -39,7 +48,7 @@ def _key(pdf_path: str | Path) -> str:
 
 
 def load(store: Path | None = None) -> dict[str, str]:
-    path = Path(store or STORE)
+    path = Path(store or store_path())
     if not path.is_file():
         return {}
     try:
@@ -66,7 +75,7 @@ def get(pdf_path: str | Path, *, store: Path | None = None,
 def set_for(pdf_path: str | Path, value: str, *, store: Path | None = None) -> None:
     if value not in CHOICES:
         raise ValueError(f"{value!r} is not one of {CHOICES}")
-    path = Path(store or STORE)
+    path = Path(store or store_path())
     path.parent.mkdir(parents=True, exist_ok=True)
     data = load(path)
     data[_key(pdf_path)] = value
@@ -74,7 +83,7 @@ def set_for(pdf_path: str | Path, value: str, *, store: Path | None = None) -> N
 
 
 def forget(pdf_path: str | Path, *, store: Path | None = None) -> None:
-    path = Path(store or STORE)
+    path = Path(store or store_path())
     data = load(path)
     if data.pop(_key(pdf_path), None) is not None:
         path.write_text(json.dumps(data, indent=2, sort_keys=True))

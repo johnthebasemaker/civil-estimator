@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     drawing_name    TEXT NOT NULL,
     fingerprint     TEXT NOT NULL DEFAULT '',
     profile         TEXT NOT NULL DEFAULT 'thorough',
+    page            INTEGER NOT NULL DEFAULT 0,
     force_rerun     INTEGER NOT NULL DEFAULT 0,
     state           TEXT NOT NULL DEFAULT 'queued',
     position        INTEGER NOT NULL DEFAULT 0,
@@ -107,6 +108,7 @@ class Job:
     drawing_name: str
     fingerprint: str = ""
     profile: str = "thorough"
+    page: int = 0                    # zero-based page of the PDF to read
     force_rerun: bool = False
     state: str = QUEUED
     position: int = 0
@@ -150,7 +152,25 @@ def _connect(db_path: Path | str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring a database made by an older build up to the current columns.
+
+    `CREATE TABLE IF NOT EXISTS` never touches a table that is already there, so
+    a column added later has to be added by hand. Two processes opening the same
+    old file at once can both try; the loser's "duplicate column" is the proof
+    the winner succeeded, not an error.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "page" not in columns:
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN page INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
 
 @contextmanager
@@ -175,17 +195,24 @@ def _write(conn: sqlite3.Connection):
 
 
 # --------------------------------------------------------------- fingerprints
-def fingerprint(pdf_path: Path | str, profile: str = "thorough") -> str:
+def fingerprint(pdf_path: Path | str, profile: str = "thorough",
+                page: int = 0) -> str:
     """Identity of "this drawing, extracted this way".
 
     Content-addressed rather than name-and-date: a reissued drawing keeps its
     filename, and an mtime changes when a file is merely copied between
     folders. Hashing the bytes means a revision is a different job and a copy is
     the same one.
+
+    The first page hashes exactly as it did before pages were tracked, so every
+    extraction saved by an older build is still found. Later pages mix their
+    number in, because page 2 of a file is not the same reading as page 1.
     """
     path = Path(pdf_path)
     digest = hashlib.sha256()
     digest.update(profile.encode())
+    if page:
+        digest.update(f"#page={int(page)}".encode())
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             digest.update(chunk)
@@ -195,7 +222,7 @@ def fingerprint(pdf_path: Path | str, profile: str = "thorough") -> str:
 # ------------------------------------------------------------------ enqueue
 def enqueue(paths, *, owner: str = "", profile: str = "thorough",
             force: bool = False, batch_id: str | None = None,
-            db_path=None) -> list[Job]:
+            page: int = 0, db_path=None) -> list[Job]:
     """Queue drawings for extraction. Returns the jobs, in order.
 
     A drawing already queued or running for this owner is not queued twice:
@@ -210,25 +237,26 @@ def enqueue(paths, *, owner: str = "", profile: str = "thorough",
             row = conn.execute(
                 "SELECT COALESCE(MAX(position), 0) AS p FROM jobs").fetchone()
             position = int(row["p"])
-            live = {r["drawing_path"] for r in conn.execute(
-                "SELECT drawing_path FROM jobs "
+            live = {(r["drawing_path"], r["page"]) for r in conn.execute(
+                "SELECT drawing_path, page FROM jobs "
                 "WHERE owner = ? AND state IN (?, ?)", (owner, QUEUED, RUNNING))}
             for path in paths:
                 path = Path(path)
-                if str(path) in live:
+                if (str(path), int(page)) in live:
                     continue
                 position += 1
                 job = Job(id=uuid.uuid4().hex[:16], batch_id=batch_id, owner=owner,
                           drawing_path=str(path), drawing_name=path.name,
-                          fingerprint=fingerprint(path, profile), profile=profile,
+                          fingerprint=fingerprint(path, profile, page),
+                          profile=profile, page=int(page),
                           force_rerun=force, position=position, created_at=now)
                 conn.execute(
                     "INSERT INTO jobs (id, batch_id, owner, drawing_path, "
-                    "drawing_name, fingerprint, profile, force_rerun, state, "
-                    "position, created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "drawing_name, fingerprint, profile, page, force_rerun, "
+                    "state, position, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (job.id, job.batch_id, job.owner, job.drawing_path,
-                     job.drawing_name, job.fingerprint, job.profile,
+                     job.drawing_name, job.fingerprint, job.profile, job.page,
                      int(job.force_rerun), QUEUED, job.position, job.created_at))
                 jobs.append(job)
     return jobs
@@ -463,6 +491,29 @@ def list_jobs(*, owner: str | None = None, batch_id: str | None = None,
     args.append(limit)
     with _db(db_path) as conn:
         return [_row_to_job(r) for r in conn.execute(sql, args)]
+
+
+def drawing_key(path: Path | str) -> str:
+    """One spelling per drawing file, for matching jobs to library entries."""
+    return str(Path(path).resolve())
+
+
+def latest_by_drawing(*, owner: str | None = None, db_path=None) -> dict:
+    """The most recent job for each (drawing path, page), newest wins.
+
+    What a drawing's status badge is built from. A drawing read on Monday,
+    re-read on Tuesday and failing on Tuesday is failing — the older success is
+    history, not its state.
+
+    Keyed by the resolved path, so a job queued as `/abs/Drawings/x.pdf` and a
+    page asking about `Drawings/x.pdf` agree that they mean the same drawing.
+    """
+    out: dict[tuple[str, int], Job] = {}
+    for job in list_jobs(owner=owner, limit=100_000, db_path=db_path):
+        key = (drawing_key(job.drawing_path), job.page)
+        if key not in out or job.created_at >= out[key].created_at:
+            out[key] = job
+    return out
 
 
 def summary(*, owner: str | None = None, db_path=None) -> dict:

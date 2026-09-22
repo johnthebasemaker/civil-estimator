@@ -69,21 +69,31 @@ def _served_from_cache(job: JS.Job) -> bool:
     return CACHE.load(job.fingerprint) is not None
 
 
-def _reads_from_text(pdf: Path) -> bool:
+def _reads_from_text(pdf: Path, page: int = 0) -> bool:
     """Whether this sheet costs no model calls."""
     try:
         import fitz
 
         from extractors import text_layer as TL
         with fitz.open(pdf) as doc:
-            return TL.has_usable_text(doc[0])
+            return TL.has_usable_text(doc[page])
     except Exception:                                    # noqa: BLE001
         return False
 
 
+def named_json(job: JS.Job) -> Path:
+    """The human-readable copy of a job's result.
+
+    Page 1 keeps the name every other tool already globs for. Later pages get
+    their own, so reading page 2 cannot overwrite page 1's result.
+    """
+    suffix = f"_p{job.page + 1}" if job.page else ""
+    return OUTPUT_DIR / f"{job.path.stem}{suffix}_extraction.json"
+
+
 def process(job: JS.Job, client: OllamaClient | None, *, db_path=None) -> str:
     """Run one job. Returns a one-word outcome for the log."""
-    named = OUTPUT_DIR / f"{job.path.stem}_extraction.json"
+    named = named_json(job)
 
     if not job.force_rerun:
         cached = CACHE.load(job.fingerprint)
@@ -108,8 +118,9 @@ def process(job: JS.Job, client: OllamaClient | None, *, db_path=None) -> str:
     JS.heartbeat(job.id, progress_pct=1.0, stage="opening the drawing",
                  db_path=db_path)
     try:
-        result = QV.extract_from_pdf(job.path, profile=job.profile,
-                                     client=client, progress=progress)
+        result = QV.extract_from_pdf(job.path, page_number=job.page,
+                                     profile=job.profile, client=client,
+                                     progress=progress)
     except Cancelled:
         JS.mark_cancelled(job.id, db_path=db_path)
         return "cancelled"
@@ -156,7 +167,7 @@ def run(*, once: bool = False, owner: str | None = None, poll: float = POLL_SECO
         # layer. So a set that has been read once runs again with Ollama off.
         needs_model = (
             not _served_from_cache(job)
-            and not _reads_from_text(job.path)
+            and not _reads_from_text(job.path, job.page)
         )
         if client is None and needs_model:
             client = OllamaClient(model=model) if model else OllamaClient()

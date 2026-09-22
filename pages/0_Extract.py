@@ -25,6 +25,7 @@ import pandas as pd
 import streamlit as st
 
 from ui import kit
+from ui import plain
 
 # PyMuPDF is the one dependency the framework Python does not carry, and this
 # is the page that needs it. sitepath has already tried to supply it from the
@@ -51,6 +52,7 @@ try:
     )
     from core import extract_cache as CACHE
     from core import classification as CLASS
+    from core import library as LIB
     from core import gaps as GAPS
     from core import jobstore as JS
     from core import set_workbook as SW
@@ -61,7 +63,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment repair path
             language="text")
     st.stop()
 
-UPLOAD_DIR = Path("output/uploads")
+UPLOAD_DIR = LIB.upload_dir()
 OUTPUT_DIR = Path("output")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -116,7 +118,9 @@ _SESSION_KEYS = (
     # Area 1 — uploads and the drawing library
     "_seen_uploads", "_confirm_delete", "_last_pdf",
     # Area 2 — extraction, the review grids and the workbook it produced
-    "extraction", "x_rules", "q_rules", "q_profile", "q_force",
+    "extraction", "extraction_origin", "_last_read_key", "_reading_job",
+    "x_profile",
+    "x_rules", "q_rules", "q_profile", "q_force",
     "ped_edit", "slab_edit", "last_workbook", "last_check_print",
     "_confirm_clear_queue",
     # Area 3 — selection, filters and the built BOQ
@@ -246,10 +250,21 @@ def _session_bar() -> None:
 # ======================================================================
 # 1 · Drawing
 # ======================================================================
-# Checked once, before anything that might need it: the batch panel in section 1
-# runs the model directly, so the health result cannot live further down.
-client = OllamaClient()
-ok, msg = client.health()
+# The page never calls the model: every reading goes through the queue and the
+# worker. It still asks whether the model is up, so it can say so plainly and
+# refuse to queue a drawing that would only fail. Cached briefly, because this
+# runs on every click and an unreachable host is a network round trip each time.
+@st.cache_data(ttl=15, show_spinner=False)
+def _model_health() -> tuple[bool, str]:
+    return OllamaClient().health()
+
+
+model_ok, model_msg = _model_health()
+MODEL_OFFLINE_NOTE = "Drawings that have been read before still open instantly."
+# How long a queued drawing may sit untouched before "nothing is reading the
+# queue" is the likelier explanation than "the worker has not polled yet". The
+# worker polls every two seconds; anything past this is not a slow start.
+WORKER_GRACE_S = 12.0
 
 
 def _rule_toggles(rules, *, key_prefix: str, disabled: bool = False) -> None:
@@ -330,8 +345,17 @@ def _queue_status() -> None:
         st.warning("Queue paused. The drawing in progress will finish; nothing "
                    "new starts until you resume.", icon="⏸")
     elif counts[JS.QUEUED] and not _worker_alive(jobs):
-        st.error("Nothing is processing this queue. Start the worker:", icon="⚠️")
-        st.code("venv/bin/python bin/worker.py", language="bash")
+        waited = time.time() - min(j.created_at for j in jobs
+                                   if j.state == JS.QUEUED)
+        if waited > WORKER_GRACE_S:
+            plain.show(plain.Problem(
+                "Nothing is reading the queue right now, so these drawings are "
+                "waiting. The reading service needs to be started on the "
+                "computer running this app.",
+                fix=f"{plain.START_ALL}\n# or only the worker:\n{plain.START_WORKER}"),
+                level="warning", icon="⏳")
+        else:
+            st.info("Starting…", icon="⏳")
 
     # The bar measures how much of the queue has been *processed*, and a failed
     # drawing has been processed. Saying "100%" on its own would read as
@@ -342,6 +366,11 @@ def _queue_status() -> None:
         st.warning(f"{counts[JS.FAILED]} drawing(s) did not extract: "
                    f"{failed_names}. The reason is in the Problem column below. "
                    f"Fix it and press Retry failed.", icon="⚠️")
+        with st.expander("Technical details", expanded=False):
+            for j in jobs:
+                if j.state == JS.FAILED and j.error:
+                    st.caption(j.drawing_name)
+                    st.code(j.error, language=None)
     st.progress(min(1.0, s["percent"] / 100.0),
                 text=f"{s['percent']:.0f}% processed — {counts[JS.DONE]} read, "
                      f"{counts[JS.QUEUED]} waiting, {counts[JS.FAILED]} failed")
@@ -393,7 +422,7 @@ def _queue_status() -> None:
         "Stage": j.stage,
         "Time": _fmt_duration(j.elapsed_s) if j.elapsed_s else "",
         "From cache": "yes" if j.from_cache else "",
-        "Problem": j.error,
+        "Problem": plain.job_problem(j.error),
     } for j in jobs]), hide_index=True, use_container_width=True)
 
     st.caption("Nothing here disappears on its own. Finished rows stay until "
@@ -438,9 +467,18 @@ def _queue_panel(drawings: list[Path]) -> None:
                f"the queue is on disk, and finished drawings stay finished.")
 
     owner = _owner()
+    if not model_ok:
+        plain.show(plain.model_problem(model_msg), level="warning", icon="🔌",
+                   extra=MODEL_OFFLINE_NOTE + " Drawings that need the model "
+                         "will wait as failed until it is back — then press "
+                         "Retry failed.")
     cached = sum(1 for p in drawings
                  if CACHE.load(JS.fingerprint(p, "thorough")) is not None)
-    if cached:
+    if cached == len(drawings):
+        st.success(f"All {cached} have been read before and will come back "
+                   f"instantly from the saved extraction — none need the "
+                   f"model.", icon="⚡")
+    elif cached:
         st.success(f"{cached} of these {len(drawings)} have been read before and "
                    f"will come back instantly from the saved extraction. Only "
                    f"{len(drawings) - cached} need the model.", icon="⚡")
@@ -791,22 +829,13 @@ for up in uploads or []:
     st.session_state[f"pick::{dest}"] = True          # newly added = ticked
 
 
-def _library() -> list[Path]:
-    """Every drawing available, uploads first, de-duplicated by real path."""
-    found, seen = [], set()
-    for path in (sorted(UPLOAD_DIR.glob("*.pdf"))
-                 + [q for q in sorted(Path(".").glob("*.pdf"))
-                    if not q.name.startswith(".")]):
-        rp = path.resolve()
-        if rp not in seen:
-            seen.add(rp)
-            found.append(path)
-    return found
-
-
-library = _library()
+# Uploads, the project's Drawings/ folder and the project root — see
+# core/library.py for why each, and how to point it somewhere else.
+_drawings = LIB.find()
+library = [d.path for d in _drawings]
 if not library:
-    st.info("Upload a drawing PDF to begin.")
+    st.info("Upload a drawing PDF to begin, or put the set in the Drawings "
+            "folder.")
     st.stop()
 
 # Select-all / clear operate by writing the checkbox keys before the widgets are
@@ -821,23 +850,18 @@ if b2.button("Clear", use_container_width=True):
         st.session_state[f"pick::{path}"] = False
     st.rerun()
 
-# The same drawing can sit in both output/uploads and the project root. They are
-# different files, so both are listed — but an identical label on two rows is a
-# trap, so the location is folded into the label when names collide.
-_name_counts: dict[str, int] = {}
-for path in library:
-    _name_counts[path.name] = _name_counts.get(path.name, 0) + 1
+# The same file name can sit in two folders as two different files. Both are
+# listed, and the folder is folded into the label exactly when names collide.
+_labels = LIB.labels(_drawings)
 
 selected: list[Path] = []
-for path in library:
+for drawing in _drawings:
+    path = drawing.path
     key = f"pick::{path}"
-    in_uploads = UPLOAD_DIR.resolve() in path.resolve().parents
-    where = "uploaded" if in_uploads else "project root"
-    label = path.name if _name_counts[path.name] == 1 else f"{path.name}  ·  {where}"
     c1, c2, c3 = st.columns([5, 2.2, 1.2])
     with c1:
-        ticked = st.checkbox(label, key=key)
-        st.caption(f"{path.stat().st_size / 1024 / 1024:.1f} MB · {where}")
+        ticked = st.checkbox(_labels[path], key=key)
+        st.caption(f"{drawing.size_mb:.1f} MB · {drawing.folder}")
     with c2:
         # Asked per drawing, not per submission: one package routinely mixes
         # new ground, work inside a live plant, and making good what is there,
@@ -856,7 +880,8 @@ for path in library:
     if ticked:
         selected.append(path)
 
-deletable = [q for q in selected if UPLOAD_DIR.resolve() in q.resolve().parents]
+_deletable_paths = {d.path for d in _drawings if d.deletable}
+deletable = [q for q in selected if q in _deletable_paths]
 if deletable:
     with b3:
         st.session_state.setdefault("_confirm_delete", False)
@@ -885,11 +910,12 @@ if st.session_state.get("_confirm_delete") and deletable:
         st.session_state["_confirm_delete"] = False
         st.rerun()
 
-# Drawings in the project root are deliberately not deletable here: this page
-# manages its own uploads, and quietly removing a file someone put in the repo
-# is not its business.
+# Drawings outside the uploads folder are deliberately not deletable here: this
+# page manages its own uploads, and quietly removing a file someone put in the
+# project is not its business.
 if selected and not deletable:
-    st.caption("Files in the project root are not deleted from this page.")
+    st.caption("Only uploaded files can be deleted from this page. Drawings in "
+               "the Drawings folder or the project root are left alone.")
 
 if not selected:
     # No drawing ticked is not the same as nothing to do. Work queued in an
@@ -924,37 +950,61 @@ project.pdf_source_path = str(source_pdf)
 # ======================================================================
 st.header("2 · Sheet")
 
-doc, page = R.open_page(source_pdf, 0)
+
+@st.cache_data(show_spinner="Looking at the sheet…", max_entries=24)
+def _sheet_analysis(path: str, modified_ns: int, page_idx: int) -> dict:
+    """Everything the page shows about a sheet before it is read.
+
+    Pure geometry, no model — but about a second of it, and the page used to
+    pay that second again on every click in the review grids below. Keyed by
+    the file's modification time, so a replaced drawing is looked at afresh.
+    """
+    from extractors import text_layer as TL
+    doc, page = R.open_page(path, page_idx)
+    try:
+        blocks = VT.find_text_blocks(page)
+        candidates = VT.callout_candidates(blocks)
+        return {
+            "info": R.page_info(page),
+            "preview": R.render_full(page, 1500).png,
+            "title_block": R.render_region(page, R.TITLE_BLOCK, 900,
+                                           max_pixels=800_000).png,
+            "n_blocks": len(blocks),
+            "n_candidates": len(candidates),
+            "n_montages": len(VT.build_montages(page, candidates)),
+            # A sheet that kept its own text layer is read from characters, not
+            # pixels. Knowing that here is what lets the page say "no model
+            # calls" honestly, and not refuse a sheet when the model is down.
+            "reads_from_text": TL.has_usable_text(page),
+        }
+    finally:
+        doc.close()
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def _fingerprint(path: str, modified_ns: int, profile: str, page_idx: int) -> str:
+    """The drawing's content hash, once per file version rather than per click."""
+    return JS.fingerprint(path, profile, page_idx)
+
+
+doc, _page0 = R.open_page(source_pdf, 0)
 n_pages = doc.page_count
 doc.close()
 page_no = 1
 if n_pages > 1:
     page_no = st.number_input("Page", min_value=1, max_value=n_pages, value=1)
+page_idx = page_no - 1
+modified_ns = source_pdf.stat().st_mtime_ns
 
-doc, page = R.open_page(source_pdf, page_no - 1)
-try:
-    info = R.page_info(page)
-    preview = R.render_full(page, 1500)
-    tb_preview = R.render_region(page, R.TITLE_BLOCK, 900, max_pixels=800_000)
-    # Locating text is pure geometry — no model, ~1 s. Do it up front so the
-    # user can see whether this sheet is extractable before spending minutes.
-    blocks = VT.find_text_blocks(page)
-    candidates = VT.callout_candidates(blocks)
-    montages = VT.build_montages(page, candidates)
-    # A sheet that kept its own text layer is read from characters, not pixels.
-    # Knowing that here is what lets the page say "no model calls" honestly, and
-    # what stops it refusing to extract when Ollama happens to be down.
-    from extractors import text_layer as TL
-    reads_from_text = TL.has_usable_text(page)
-finally:
-    doc.close()
-
-model_calls = 0 if reads_from_text else len(montages) + 2
+sheet = _sheet_analysis(str(source_pdf), modified_ns, page_idx)
+info = sheet["info"]
+reads_from_text = sheet["reads_from_text"]
+model_calls = 0 if reads_from_text else sheet["n_montages"] + 2
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Sheet", info["sheet_size"])
-c2.metric("Text blocks found", len(blocks))
-c3.metric("Callout candidates", len(candidates))
+c2.metric("Text blocks found", sheet["n_blocks"])
+c3.metric("Callout candidates", sheet["n_candidates"])
 c4.metric("Model calls needed", model_calls)
 
 if reads_from_text:
@@ -966,72 +1016,190 @@ elif not info["has_text_layer"]:
     st.info("This PDF has no text layer — the text is drawn as curves, so a text "
             "parser would return nothing. The blocks above were located from the "
             "drawing's vector geometry, which costs no model time.")
-if not candidates and not reads_from_text:
-    st.warning("No text blocks located. If this sheet is a scan rather than CAD "
-               "vector output, choose the **sweep** profile below — it looks at "
+# Worded against the metrics right above it. "No text blocks located" printed
+# beside "13 text blocks found" read as the page contradicting itself; the real
+# situation is usually text that is not a quantity callout.
+if not reads_from_text and not sheet["n_blocks"]:
+    st.warning("No text was found on this sheet. If it is a scan rather than "
+               "CAD output, choose the **sweep** profile below — it looks at "
                "the whole sheet instead, but takes far longer.")
+elif not reads_from_text and not sheet["n_candidates"]:
+    st.warning(f"{sheet['n_blocks']} text block(s) were found, but none of them "
+               f"looks like a quantity callout such as “P3(350x350) 11Nos”. If "
+               f"you expected quantities on this sheet, choose the **sweep** "
+               f"profile below — it looks at the whole sheet instead, but takes "
+               f"far longer.")
 
 pv1, pv2 = st.columns([3, 1])
-SC.image(pv1, preview.png, caption=f"{source_pdf.name} — page {page_no}")
-SC.image(pv2, tb_preview.png, caption="Title block (read first)")
+SC.image(pv1, sheet["preview"], caption=f"{source_pdf.name} — page {page_no}")
+SC.image(pv2, sheet["title_block"], caption="Title block (read first)")
 
 
 # ======================================================================
-# 3 · Extract
+# 3 · Read the drawing
 # ======================================================================
-st.header("3 · Extract")
+# The page never reads a drawing itself. A drawing read before comes straight
+# back from its saved extraction; anything else goes on the queue, and the
+# worker reads it in its own process. Running the model in here is what froze
+# the app and heated the laptop, and it held the browser tab hostage for the
+# whole read.
+st.header("3 · Read the drawing")
 
-if reads_from_text:
-    st.caption("The local model is not consulted for this sheet.")
-elif ok:
-    st.success(f"Local model ready — {msg}")
-else:
-    st.error(f"Local model unavailable — {msg}")
-    st.code("ollama serve\nollama pull qwen2.5vl:7b", language="bash")
+read_key = f"{source_pdf}#{page_idx}"
+if st.session_state.get("_last_read_key") != read_key:
+    st.session_state.pop("extraction", None)
+    st.session_state.pop("extraction_origin", None)
+    st.session_state["_last_read_key"] = read_key
 
 e1, e2 = st.columns([1, 2])
 with e1:
     profile = st.selectbox(
-        "Profile", ["thorough", "quick", "sweep", "fast"],
+        "Profile", ["thorough", "quick", "sweep", "fast"], key="x_profile",
         help="thorough — locate text, then transcribe it (default, fastest). "
              "quick — largest text only. "
              "sweep / fast — blind tile sweep for scanned sheets; much slower.")
 cfg = ExtractionConfig(**PROFILES[profile].__dict__)
-n_calls = (len(montages) + 2 if cfg.strategy == "montage"
+n_calls = (sheet["n_montages"] + 2 if cfg.strategy == "montage"
            else len(QV._tile_plan(cfg)) + 2)
 if reads_from_text and cfg.strategy == "montage":
     n_calls = 0
+needs_model = n_calls > 0
 with e2:
     if n_calls:
         st.caption(f"About **{n_calls} model calls ≈ {n_calls * 48 // 60} min "
-                   f"{n_calls * 48 % 60} s** on this machine. The window can "
-                   f"stay in the background, but leave it open.")
+                   f"{n_calls * 48 % 60} s** on this machine. You can close the "
+                   f"tab while it reads — the result is saved and waiting when "
+                   f"you come back.")
     else:
         st.caption("**Under a second**, and no model time at all. Choosing the "
                    "sweep profile would override that and look at pixels "
                    "instead, which is only worth doing if the text layer turns "
                    "out to be wrong.")
 
-# Only the model's absence blocks extraction, and only for a sheet that needs
-# it. Refusing to read a drawing whose own text layer answers the question was
-# the reason five of these sheets looked unextractable.
-if st.button("🔍 Extract drawing", type="primary", disabled=not (ok or n_calls == 0),
-             use_container_width=True):
-    bar = st.progress(0.0, text="starting…")
 
-    def progress(label: str, i: int, n: int) -> None:
-        bar.progress(min(1.0, i / max(n, 1)), text=f"[{i}/{n}] {label}")
+@st.fragment(run_every="2s")
+def _reading_progress(job_id: str) -> None:
+    """One drawing being read, live. Reruns itself; the page does not."""
+    job = JS.get(job_id)
+    if job is None or job.state not in (JS.QUEUED, JS.RUNNING):
+        # Finished, failed, stopped or cleared: the whole page knows what to
+        # show next, so hand back to it.
+        if job is not None and job.state == JS.DONE:
+            saved = CACHE.load(job.fingerprint)
+            if saved is not None:
+                st.session_state["extraction"] = saved
+                st.session_state["extraction_origin"] = "read"
+        st.rerun()
 
-    with st.spinner("Reading the drawing…"):
-        st.session_state.extraction = QV.extract_from_pdf(
-            source_pdf, page_number=page_no - 1, config=cfg,
-            client=client, progress=progress)
-    bar.empty()
-    st.rerun()
+    if job.state == JS.RUNNING:
+        st.progress(min(1.0, job.progress_pct / 100.0),
+                    text=f"Reading — {job.progress_pct:.0f}% · "
+                         f"{job.stage or 'working'} · "
+                         f"{_fmt_duration(time.time() - job.started_at)} elapsed")
+    else:
+        waiting = JS.list_jobs(owner=job.owner, states=[JS.QUEUED, JS.RUNNING])
+        ahead = sum(1 for j in waiting if j.id != job.id and (
+            j.state == JS.RUNNING or j.position < job.position))
+        if JS.is_paused(job.owner):
+            st.info("The queue is paused, so this drawing is waiting. Resume it "
+                    "to start reading.", icon="⏸")
+            if st.button("▶ Resume the queue", key="x_resume"):
+                JS.set_paused(False, owner=job.owner)
+                st.rerun()
+        elif (not _worker_alive(waiting)
+              and time.time() - job.created_at > WORKER_GRACE_S):
+            plain.show(plain.Problem(
+                "Nothing is reading the queue right now, so this drawing is "
+                "waiting. The reading service needs to be started on the "
+                "computer running this app.",
+                fix=f"{plain.START_ALL}\n# or only the worker:\n{plain.START_WORKER}"),
+                level="warning", icon="⏳")
+        elif ahead:
+            st.info(f"Waiting its turn — {ahead} drawing(s) ahead of it.", icon="⏳")
+        else:
+            st.info("Starting…", icon="⏳")
+
+    if st.button("⏹ Stop", key="x_stop"):
+        JS.request_cancel(job.id)
+        st.rerun()
+    st.caption("You can leave this page or close the tab. The reading carries "
+               "on, and the result is saved when it finishes.")
+
+
+def _queue_reading(pdf: Path, *, owner: str, profile: str, page: int,
+                   force: bool = False) -> None:
+    """Put one drawing on the queue and remember that this session asked."""
+    added = JS.enqueue([pdf], owner=owner, profile=profile, page=page, force=force)
+    if added:
+        st.session_state["_reading_job"] = added[0].id
+
+
+owner = _owner()
+latest = JS.latest_by_drawing(owner=owner).get(
+    (JS.drawing_key(source_pdf), page_idx))
+live = latest if latest is not None and latest.state in (JS.QUEUED, JS.RUNNING) else None
+
+# Cache first. The newest finished reading of this file wins, then a saved
+# reading under the chosen profile — which is what makes a drawing read last
+# week, or by a colleague, open in a moment with the model switched off. A job's
+# result counts only while the file still has the bytes it was read from: a
+# drawing reissued under the same name is a different drawing.
+if "extraction" not in st.session_state and live is None:
+    saved = None
+    if (latest is not None and latest.state == JS.DONE
+            and latest.fingerprint == _fingerprint(str(source_pdf), modified_ns,
+                                                   latest.profile, page_idx)):
+        saved = CACHE.load(latest.fingerprint)
+    if saved is None:
+        saved = CACHE.load(_fingerprint(str(source_pdf), modified_ns, profile,
+                                        page_idx))
+    if saved is not None:
+        # "Read" when this session asked for it and it has just come back;
+        # "saved" when it was already there before anyone asked.
+        mine = latest is not None and latest.id == st.session_state.get("_reading_job")
+        st.session_state["extraction"] = saved
+        st.session_state["extraction_origin"] = "read" if mine else "saved"
+
+if live is not None:
+    _reading_progress(live.id)
+    st.stop()
 
 result: ExtractionResult | None = st.session_state.get("extraction")
 if result is None:
+    if latest is not None and latest.state == JS.FAILED:
+        plain.show(plain.Problem(plain.job_problem(latest.error),
+                                 detail=latest.error), icon="⚠️")
+    if needs_model and not model_ok:
+        plain.show(plain.model_problem(model_msg), level="warning", icon="🔌",
+                   extra=MODEL_OFFLINE_NOTE)
+    elif not needs_model:
+        st.caption("The local model is not consulted for this sheet.")
+    failed_before = latest is not None and latest.state == JS.FAILED
+    if st.button("🔍 Try reading it again" if failed_before else "🔍 Read this drawing",
+                 type="primary", use_container_width=True,
+                 disabled=needs_model and not model_ok):
+        _queue_reading(source_pdf, owner=owner, profile=profile, page=page_idx)
+        st.rerun()
     st.stop()
+
+r1, r2 = st.columns([3, 1])
+with r1:
+    if st.session_state.get("extraction_origin") == "saved":
+        st.success("Opened the saved reading of this drawing — no model time "
+                   "used.", icon="⚡")
+    else:
+        st.success("Read and saved. Next time it opens instantly.", icon="✅")
+with r2:
+    if st.button("🔁 Read again", use_container_width=True,
+                 disabled=needs_model and not model_ok,
+                 help=f"Reads the drawing again with the {profile} profile and "
+                      f"replaces the saved result. Use it after a reissue under "
+                      f"the same name, or to try a different profile."):
+        _queue_reading(source_pdf, owner=owner, profile=profile, page=page_idx,
+                       force=True)
+        st.session_state.pop("extraction", None)
+        st.session_state.pop("extraction_origin", None)
+        st.rerun()
 
 
 # ======================================================================
@@ -1173,8 +1341,8 @@ if any(findings.get(k) for k in findings):
                      expanded=False):
         st.caption("These are recognised but incomplete — a curb wall callout "
                    "gives thickness and height but not its run length, a sump "
-                   "plan dimension says nothing about depth. Enter them in "
-                   "**1_Input** where you can supply the missing figures.")
+                   "plan dimension says nothing about depth. Enter them on "
+                   "the **Input** page, where you can supply the missing figures.")
         labels = {"curb_walls": "Curb walls", "sumps": "Sumps", "levels": "Levels",
                   "insert_plates": "Insert plates", "epoxy": "Epoxy coating",
                   "rebar": "Rebar callouts", "thicknesses": "Thickness notes"}
@@ -1427,5 +1595,5 @@ with st.sidebar:
     st.write(f"Grade slabs: {len(slabs)}")
     st.write(f"Extraction: {result.total_elapsed_s:.0f} s")
     st.caption("Excavation, joints, sump, embedments and manual rebar are "
-               "entered in **1_Input**.")
+               "entered on the **Input** page.")
 kit.sidebar_account()
