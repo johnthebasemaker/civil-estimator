@@ -2,15 +2,19 @@
 
 Standalone Streamlit tool for civil construction takeoff and BOQ generation from structural drawings.
 
-**Current state: Phase 2 complete.** Structured input form → 10-sheet Excel workbook with formulas, wastage, and SAR costing, plus a local Qwen2.5-VL:7b vision extractor that pre-fills the form from a drawing PDF.
+**Current state:** local Qwen2.5-VL:7b vision extraction, a 10-sheet Excel
+workbook with formulas, wastage and SAR costing, and a one-page workspace with
+four tabs — **Drawings · Queue · BOQ · Pricing**. Picking the project up after a
+break? Start with [SESSION_HANDOVER.md](SESSION_HANDOVER.md).
 
 Upload a drawing, get a workbook:
 
 ```bash
-ollama serve && ./bin/app.sh
+./bin/ce start
 ```
 
-Then open **Drawing → BOQ** in the sidebar. Headless equivalents:
+That starts the app and the reading worker together and prints the URL to open;
+the app lands on the Drawings tab. Headless equivalents:
 
 ```bash
 venv/bin/python run_pipeline.py --derive all --audit-sheet   # one drawing
