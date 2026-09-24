@@ -177,6 +177,7 @@ SESSION_KEYS = (
     "x_profile", "x_rules", "ped_edit", "slab_edit", "last_workbook",
     "last_check_print", "_queued_note", "_sidebar_drawing",
     "x_merge", "x_audit", "x_check", "x_verifier",
+    "evidence_table", "trace_zoom",
     # Queue
     "_confirm_clear_queue", "_ws_signature",
     # BOQ

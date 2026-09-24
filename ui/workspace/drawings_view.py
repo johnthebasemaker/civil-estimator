@@ -45,6 +45,7 @@ from extractors.models import ExtractionResult
 from extractors.qwen_vision import PROFILES, ExtractionConfig
 from ui import plain
 from ui.workspace import common as C
+from ui.workspace import viewer as VW
 
 PROFILE_CHOICES = ["thorough", "quick", "sweep", "fast"]
 PROFILE_HELP = ("thorough — locate text, then transcribe it (default, fastest). "
@@ -504,10 +505,94 @@ def _sheet(path: Path) -> dict:
                    f"**sweep** profile below — it looks at the whole sheet "
                    f"instead, but takes far longer.")
 
-    pv1, pv2 = st.columns([3, 1])
-    SC.image(pv1, sheet["preview"], caption=f"{path.name} — page {page_no}")
-    SC.image(pv2, sheet["title_block"], caption="Title block (read first)")
+    # The reading is loaded before the sheet is drawn, because once it exists
+    # the sheet is no longer a picture of a drawing — it is the evidence.
+    _load_reading(path, sheet)
+    result = st.session_state.get("extraction")
+    if result is not None:
+        _evidence(path, sheet, result)
+    else:
+        pv1, pv2 = st.columns([3, 1])
+        SC.image(pv1, sheet["preview"], caption=f"{path.name} — page {page_no}")
+        SC.image(pv2, sheet["title_block"], caption="Title block (read first)")
     return sheet
+
+
+# --------------------------------------------------- 1b · Where it came from
+ZOOM = {"Tight": 0.25, "Normal": 0.6, "Wide": 1.4}
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _overlay(path: str, modified_ns: int, page_idx: int,
+             boxes: tuple, selected: int | None) -> bytes:
+    """The sheet with every located value boxed. Cached per selection."""
+    base = sheet_analysis(path, modified_ns, page_idx)["preview"]
+    return VW.draw_boxes(base, boxes, selected=selected)
+
+
+@st.cache_data(show_spinner="Redrawing that part of the sheet…", max_entries=64)
+def _trace(path: str, modified_ns: int, page_idx: int,
+           rect: tuple, pad: float, source: str) -> bytes:
+    """One value's own piece of the sheet, drawn again from the PDF."""
+    region = VW.crop_region(rect, pad=pad)
+    png = VW.render_region(path, page_idx, region, 1400)
+    return VW.draw_trace(png, rect, region, source)
+
+
+def _evidence(path: Path, sheet: dict, result: ExtractionResult) -> None:
+    """The overlay, the trace panel and the table that drives them."""
+    items = VW.evidence(result)
+    boxes = VW.boxes_of(items)
+    rows = VW.ordered(items)
+    selection = st.session_state.get("evidence_table", {})
+    picked_rows = (selection or {}).get("selection", {}).get("rows", [])
+    chosen = rows[picked_rows[0]] if picked_rows and picked_rows[0] < len(rows) else None
+
+    tally = VW.counts(items)
+    st.caption(f"**{len(boxes)} of {len(items)} value(s) are boxed on the sheet** — "
+               + " · ".join(f"{n} {VW.SOURCE_LABEL[k].lower()}"
+                            for k, n in tally.items())
+               + ". A value with no box was not read from one place on the sheet "
+                 "(the title block, or a slab read off the plan view).")
+
+    left, right = st.columns([3, 2])
+    with left:
+        SC.image(left, _overlay(str(path), sheet["modified_ns"],
+                                sheet["page_idx"], boxes,
+                                chosen.number if chosen else None),
+                 caption=f"{path.name} — page {sheet['page_no']} · "
+                         f"numbers match the table below and the workbook's "
+                         f"Verification sheet")
+    with right:
+        if chosen is None:
+            SC.image(right, sheet["title_block"],
+                     caption="Title block (read first)")
+            st.caption("Pick a row below to see where that value came from, "
+                       "redrawn from the PDF rather than magnified.")
+        elif not chosen.traceable:
+            st.info(f"**{chosen.title}** — {chosen.extracted}", icon="🔎")
+            st.caption("This one has no single place on the sheet to point at. "
+                       + (f"Grid reference {chosen.grid_ref}. " if chosen.grid_ref else "")
+                       + (chosen.note or ""))
+        else:
+            zoom = st.radio("Detail", list(ZOOM), index=1, horizontal=True,
+                            key="trace_zoom", label_visibility="collapsed")
+            SC.image(right, _trace(str(path), sheet["modified_ns"],
+                                   sheet["page_idx"], chosen.rect, ZOOM[zoom],
+                                   chosen.source),
+                     caption=f"{chosen.number}. {chosen.title}"
+                             + (f" · grid {chosen.grid_ref}" if chosen.grid_ref else ""))
+            st.markdown(f"**{chosen.extracted}** — "
+                        f"{VW.SOURCE_LABEL[chosen.source].lower()}")
+            if chosen.callout:
+                st.code(chosen.callout, language=None)
+            if chosen.note:
+                st.caption(chosen.note)
+
+    st.dataframe(pd.DataFrame(VW.table_rows(items)), hide_index=True,
+                 use_container_width=True, height=260,
+                 on_select="rerun", selection_mode="single-row",
+                 key="evidence_table")
 
 
 # ---------------------------------------------------------------- 2 · Read
@@ -556,6 +641,49 @@ def _reading_progress(job_id: str) -> None:
                "on, and the result is saved when it finishes.")
 
 
+def _latest_job(path: Path, page_idx: int):
+    """The newest job for this drawing and page, and whether it is still live."""
+    latest = JS.latest_by_drawing(owner=C.owner()).get(
+        (JS.drawing_key(path), page_idx))
+    live = (latest if latest is not None
+            and latest.state in (JS.QUEUED, JS.RUNNING) else None)
+    return latest, live
+
+
+def _load_reading(path: Path, sheet: dict) -> None:
+    """Put this drawing's saved reading into the session, if there is one.
+
+    Cache first — what makes a drawing read last week, or by a colleague, open
+    in a moment with the model switched off. State only: the reading has to be
+    in hand before section 1 draws the sheet, because with a reading the sheet
+    is drawn as evidence rather than as a picture.
+    """
+    page_idx = sheet["page_idx"]
+    read_key = f"{path}#{page_idx}"
+    if st.session_state.get("_last_read_key") != read_key:
+        # The grids' pending edits are row-by-row changes to *that* drawing's
+        # rows. Carried over, they would be applied to the next drawing's. The
+        # evidence selection belongs to the old drawing's rows too.
+        for key in ("extraction", "extraction_origin", "ped_edit", "slab_edit",
+                    "evidence_table"):
+            st.session_state.pop(key, None)
+        st.session_state["_last_read_key"] = read_key
+
+    latest, live = _latest_job(path, page_idx)
+    if "extraction" in st.session_state or live is not None:
+        return
+    profile = st.session_state.get("x_profile", "thorough")
+    fp = saved_fingerprint(path, latest, profile, page_idx)
+    saved = CACHE.load(fp) if fp else None
+    if saved is None:
+        return
+    # "Read" when this session asked for it and it has just come back; "saved"
+    # when it was already there before anyone asked.
+    mine = latest is not None and latest.id == st.session_state.get("_reading_job")
+    st.session_state["extraction"] = saved
+    st.session_state["extraction_origin"] = "read" if mine else "saved"
+
+
 def _queue_reading(pdf: Path, *, profile: str, page: int, force: bool = False) -> None:
     """Put one drawing on the queue and remember that this session asked."""
     added = JS.enqueue([pdf], owner=C.owner(), profile=profile, page=page,
@@ -573,14 +701,6 @@ def _read(path: Path, sheet: dict) -> ExtractionResult | None:
     """
     st.subheader("2 · Read the drawing")
     page_idx = sheet["page_idx"]
-    read_key = f"{path}#{page_idx}"
-    if st.session_state.get("_last_read_key") != read_key:
-        # The grids' pending edits are row-by-row changes to *that* drawing's
-        # rows. Carried over, they would be applied to the next drawing's.
-        for key in ("extraction", "extraction_origin", "ped_edit", "slab_edit"):
-            st.session_state.pop(key, None)
-        st.session_state["_last_read_key"] = read_key
-
     e1, e2 = st.columns([1, 2])
     with e1:
         profile = st.selectbox("Profile", PROFILE_CHOICES, key="x_profile",
@@ -604,21 +724,7 @@ def _read(path: Path, sheet: dict) -> ExtractionResult | None:
                        "turns out to be wrong.")
 
     model_ok, model_msg = C.model_health()
-    latest = JS.latest_by_drawing(owner=C.owner()).get(
-        (JS.drawing_key(path), page_idx))
-    live = latest if latest is not None and latest.state in (JS.QUEUED, JS.RUNNING) else None
-
-    # Cache first — which is what makes a drawing read last week, or by a
-    # colleague, open in a moment with the model switched off.
-    if "extraction" not in st.session_state and live is None:
-        fp = saved_fingerprint(path, latest, profile, page_idx)
-        saved = CACHE.load(fp) if fp else None
-        if saved is not None:
-            # "Read" when this session asked for it and it has just come back;
-            # "saved" when it was already there before anyone asked.
-            mine = latest is not None and latest.id == st.session_state.get("_reading_job")
-            st.session_state["extraction"] = saved
-            st.session_state["extraction_origin"] = "read" if mine else "saved"
+    latest, live = _latest_job(path, page_idx)
 
     if live is not None:
         _reading_progress(live.id)

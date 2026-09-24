@@ -250,6 +250,35 @@ opens it; it is now a short shell over `ui/workspace/`. Pedestal heights are not
 printed on these drawings, so the drawing's review grid asks for them explicitly
 before the workbook is worth trusting.
 
+## Where each value came from
+
+Open a drawing that has been read and the sheet stops being a picture of a
+drawing: every located value is boxed, numbered and coloured by how it was
+obtained.
+
+* **Green** — read from the sheet's own text. **Navy** — read by the model.
+  **Amber** — read, but the drawing left a figure out (a pedestal callout gives
+  600 x 500 and a count, never a height). Amber is not "this number was
+  invented": the number was read, and something about it still has to come from
+  a person. Those boxes are where.
+* **Pick a row and the sheet is redrawn around it**, from the PDF's vectors
+  rather than by enlarging the picture — so the closer you look the sharper it
+  gets. Tight / Normal / Wide decides how much of the surrounding linework
+  comes with it.
+* **Box 7 is row 7** in the table *and* row #7 on the workbook's Verification
+  sheet, so the three can be laid side by side. (The check print used to number
+  only the boxed values, which made its "1." the Verification sheet's "#6".)
+* Values with no single place on the sheet — the title block, a slab read off
+  the plan view — still appear in the table, marked as having no box, because
+  they still have to be checked.
+
+Tracing runs one way, from a row to the sheet. Clicking a box to select its row
+would need an interactive canvas (Plotly or a custom component), and that was
+deliberately not added: `AppTest`, which every UI test here is built on, cannot
+see a Plotly chart, so those interactions could not be tested and would rot
+silently. The box numbers carry the other direction. The dependency list is
+still seven packages.
+
 ## How it works
 
 **Locate the text first, with geometry, not the model.** The drawing has no text

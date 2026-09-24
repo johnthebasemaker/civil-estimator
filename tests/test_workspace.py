@@ -274,3 +274,75 @@ class TestTheProjectEstimate:
         at = _run()
         assert any("Project estimate" in i.value or "Elements" in i.value
                    for i in at.info)
+
+
+class TestTheDrawingViewer:
+    """Phase 2: the sheet shows where every value came from, and a row can be
+    traced back to its own piece of the drawing."""
+
+    def _open(self, ws):
+        _saved_reading(A)
+        at = _run()
+        next(b for b in at.button
+             if b.key and b.key.startswith("open::")).click().run()
+        return at
+
+    def _evidence_table(self, at):
+        """The viewer's table is the one with the evidence columns."""
+        return next(d for d in at.dataframe
+                    if list(d.value.columns)[:3] == ["#", "On sheet", "Item"])
+
+    def test_the_sheet_says_how_many_values_it_can_point_at(self, ws):
+        at = self._open(ws)
+        assert not at.exception
+        assert any("boxed on the sheet" in c.value for c in at.caption)
+
+    def test_every_value_is_listed_with_where_it_came_from(self, ws):
+        from core import extract_cache as CACHE
+        from core import jobstore as JS
+        from ui.workspace import viewer as VW
+
+        at = self._open(ws)
+        result = CACHE.load(JS.fingerprint(A, "thorough"))
+        table = self._evidence_table(at).value
+        assert len(table) == len(VW.evidence(result))
+        assert set(table["Source"]) <= set(VW.SOURCE_LABEL.values())
+
+    def test_the_boxed_ones_come_first(self, ws):
+        table = self._evidence_table(self._open(ws)).value
+        assert table.iloc[0]["On sheet"]
+
+    def test_picking_a_row_traces_it_back_to_the_sheet(self, ws):
+        at = self._open(ws)
+        at.session_state["evidence_table"] = {"selection": {"rows": [0],
+                                                            "columns": []}}
+        at.run()
+        assert not at.exception
+        assert any(r.label == "Detail" for r in at.radio), \
+            "no zoom control for the traced region"
+
+    def test_the_trace_is_redrawn_from_the_pdf_not_magnified(self, ws):
+        """The region is rendered again from the vectors, so it is sharper the
+        closer you look — the opposite of enlarging a screenshot."""
+        import inspect
+
+        from ui.workspace import drawings_view as DV
+
+        assert "render_region" in inspect.getsource(DV._trace)
+
+    def test_a_drawing_not_read_yet_shows_the_plain_sheet(self, ws):
+        at = _run()
+        next(b for b in at.button
+             if b.key and b.key.startswith("open::")).click().run()
+        assert not at.exception
+        assert not any("boxed on the sheet" in c.value for c in at.caption)
+
+    def test_the_selection_does_not_follow_you_to_another_drawing(self, ws):
+        at = self._open(ws)
+        at.session_state["evidence_table"] = {"selection": {"rows": [0],
+                                                            "columns": []}}
+        at.run()
+        next(b for b in at.button if b.label == "Next ›").click().run()
+        assert not at.exception
+        assert "evidence_table" not in at.session_state or not (
+            at.session_state["evidence_table"].get("selection", {}).get("rows"))
