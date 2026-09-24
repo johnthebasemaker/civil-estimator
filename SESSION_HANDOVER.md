@@ -1,7 +1,7 @@
 # Session handover — Civil Estimator
 
-**Written 2026-09-24, at the end of Phases 0 and 1. The next session starts at
-Phase 2 (the drawing viewer).**
+**Written 2026-09-24, after Phases 0, 1 and 2. The next session starts at
+Phase 3 (priced set BOQ, history, revisions, sign-off).**
 
 This is for whoever picks the project up with no memory of the sessions that
 produced it. It records what changed, *why* it changed, the traps found the
@@ -14,9 +14,9 @@ hard way, and where Phase 2 plugs in.
 | | |
 |---|---|
 | Branch | `main` |
-| Head | `a4eb7f6` — Phase 1 (#3) |
-| Before it | `0f40e23` — Phase 0 (#2) |
-| Tests | **671 passed, 0 failed, 0 skipped** — re-run and verified 2026-09-24 (~6.5 min) |
+| Head | Phase 2 — the drawing viewer (#5) |
+| Before it | `a4eb7f6` Phase 1 (#3), `0f40e23` Phase 0 (#2) |
+| Tests | **701 passed, 0 failed, 0 skipped** — verified 2026-09-24 (~6.5 min) |
 | Repository | `johnthebasemaker/civil-estimator`, **private** |
 
 Both phases are merged. The working tree is clean and nothing is left running.
@@ -37,15 +37,17 @@ An earlier note put this at "561 passing tests". That was the figure on
 | 2026-09-15, after the last session | 561 passed |
 | 2026-09-22, `main` as found at the start of Phase 0 | 535 passed, **18 failed, 4 errors**, 4 skipped |
 | After Phase 0 | 629 passed, 0 failed, 0 skipped |
-| After Phase 1 (now) | **671 passed, 0 failed, 0 skipped** |
+| After Phase 1 | 671 passed, 0 failed, 0 skipped |
+| After Phase 2 (now) | **701 passed, 0 failed, 0 skipped** |
 
 `main` was genuinely red when Phase 0 began. Every one of those 22 failures
 had one cause: the tests find their drawing through the app's drawing list, the
 uploads folder had been emptied, and the list could not see `Drawings/`. Phase 0
 fixed the cause, which is why the count jumps.
 
-The 561 → 671 difference is +68 new tests in Phase 0 and +42 net in Phase 1.
-Phase 1 also *removed* the per-page gate tests for the four pages it deleted.
+The 561 → 701 difference is +68 new tests in Phase 0, +42 net in Phase 1 and
++30 in Phase 2. Phase 1 also *removed* the per-page gate tests for the four
+pages it deleted.
 
 ### Running it
 
@@ -241,6 +243,7 @@ worker running** — verified in the live app with all 12 drawings and no worker
 | `pages/0_Extract.py` | the workspace shell (gate, header, session bar, tabs, sidebar) |
 | `ui/workspace/common.py` | session, Clear session, save/load, model health, the per-tab guard |
 | `ui/workspace/drawings_view.py` | the list, badges, upload, delete; and one drawing: sheet → read → review → BOQ |
+| `ui/workspace/viewer.py` | the evidence overlay, provenance colours and the redrawn trace |
 | `ui/workspace/queue_view.py` | the queue fragment and its controls |
 | `ui/workspace/boq_view.py` | combined bill; project estimate (was Input/Review/BOM) |
 | `ui/workspace/pricing_view.py` | rates and totals (was Costing) |
@@ -342,14 +345,41 @@ real answer if management needs this regularly.
 
 ---
 
-## 8. Next: Phase 2 — the drawing viewer
+## 8. Phase 2 — the drawing viewer (delivered)
 
-Agreed scope: **zoom and pan, an evidence overlay, click-to-trace both ways,
-and colours by source.**
+Agreed scope was: **zoom and pan, an evidence overlay, click-to-trace both ways,
+and colours by source.** What shipped, and the one deliberate departure:
 
-### What already exists to build on
+* **Evidence overlay** — open a read drawing and the sheet carries a numbered,
+  coloured box on every located value (`ui/workspace/viewer.py`).
+* **Colours are provenance, not confidence** — green: read from the sheet's
+  text; navy: read by the model; amber: read, but the drawing left a figure out.
+  The first draft called the amber ones "assumed", which libelled dimensions
+  that had been read correctly when only the *height* was missing.
+* **Trace, by redrawing rather than zooming** — pick a row and the region is
+  rendered again from the PDF's vectors at 1400 px, so it sharpens as you go in.
+  Tight / Normal / Wide controls the surrounding context.
+* **One-way tracing, deliberately.** Row → sheet works; clicking a box to select
+  its row does not. It would need Plotly or a custom component, and `AppTest`
+  cannot see a Plotly chart — every such interaction would be untestable in the
+  harness this project's 600-plus tests rely on. The box numbers carry the other
+  direction: box 7 is row 7 in the table and row #7 on the workbook's
+  Verification sheet. **No new dependency; still seven packages.**
+* **Bug found and fixed on the way:** the check print numbered only the boxed
+  items while the Verification sheet numbered all of them, so box "1." on the
+  print was row "#6" in the workbook — the two artefacts a checker holds side by
+  side disagreed.
 
-Most of the data work is done. Do not re-derive it.
+### If the one-way limit ever bites
+
+Clicking the sheet needs a component. Before adding one, weigh it against the
+test harness: anything `AppTest` cannot see is a feature that cannot be
+regression-tested here. `st.plotly_chart(on_select=…)` does exist in Streamlit
+1.39, so the path is open if the trade is worth making.
+
+## 8b. What Phase 2 was built on
+
+Most of the data work already existed — useful to know for Phase 3 too.
 
 * **Positions are already extracted.** `PedestalExtraction.source_rect`
   (`extractors/models.py:84`) and `TranscriptBlock.rect_norm`
@@ -367,52 +397,36 @@ Most of the data work is done. Do not re-derive it.
   (1500 px) keyed by the file's modification time. The viewer should reuse or
   extend it rather than re-rendering per interaction.
 
-### Where it plugs in
+### Where it landed
 
-`ui/workspace/drawings_view.py`: section **1 · Sheet** (`_sheet`) is the static
-preview to replace, and **3 · Review and correct** (`_review`) holds the grids
-that click-to-trace must talk to.
+`ui/workspace/drawings_view.py`: section **1 · Sheet** now shows the plain
+preview until a drawing has been read and the evidence viewer afterwards
+(`_evidence`, `_overlay`, `_trace`). Loading a saved reading moved ahead of the
+sheet (`_load_reading`) so section 1 knows whether it is drawing a picture or
+drawing evidence.
 
-### Open questions to settle first
+### How the decision went
 
-**1. Which interaction library — and whether to add a dependency.** Checked on
-this machine, so the next session need not:
-
-* `st.plotly_chart(on_select=…, selection_mode=…)` **does exist in Streamlit
-  1.39**, so click-to-select needs no Streamlit upgrade.
-* **Plotly is not installed.** `requirements.txt` pins seven packages, and the
-  README states the project has "no cloud APIs, no fine-tuning, no new Python
-  dependencies". Plotly would be the eighth, and it is not small.
-* `streamlit-image-coordinates` and `streamlit-drawable-canvas` are not
-  installed either, and are also new dependencies.
-
-So this is the user's call, not an implementation detail:
+The choice was between a new dependency and the tools already here:
 
 | Option | Gets | Costs |
 |---|---|---|
-| Plotly image + shapes | zoom, pan, click-to-select, hover, all native | a new dependency; the README's claim needs rewording |
-| PyMuPDF + `st.image` only | no new dependency; render any region at high DPI on demand (`R.render_region`, already used for the title block); a row can show its own crop, boxed | one-way tracing (row → sheet); zoom by control rather than by mouse |
+| Plotly image + shapes | mouse zoom and pan, click a box to select its row | an eighth dependency, and **`AppTest` cannot see a Plotly chart**, so none of it could be regression-tested |
+| PyMuPDF + `st.dataframe` selection *(chosen)* | any region redrawn from the vectors at any size, native row selection that `AppTest` can drive, no new dependency | tracing runs one way; zoom by control rather than by mouse |
 
-The second option covers most of the value — *"show me where this number came
-from"* — with the tools already in the repo, and `build_check_print` proves the
-drawing can be boxed and annotated. Ask before adding Plotly.
+The harness settled it. A feature the 600-plus-test suite cannot see is a
+feature that will quietly break.
 
-**2. Layout.** Overlay inside section 1, or a two-pane view (sheet beside the
-grids) so a click can highlight both ways?
+### How it was verified
 
-**3. Performance.** A 1500 px sheet plus ~100 shapes per redraw. `sheet_analysis`
-caches the render per file version; check a redraw before committing to
-per-interaction updates.
-
-### Acceptance, in the project's own terms
-
-* An A0 sheet can be zoomed enough to read a callout.
-* Every quantity's box can be shown on the sheet, coloured by source: exact
-  (text layer), model-read, derived, assumed.
-* Clicking a BOQ line moves the sheet to its box; clicking a box selects the
-  line.
-* Nothing calls the model (the syntax-tree guard still passes), no view calls
-  `st.stop()`, and no test touches real data.
+* An A0 sheet can be read: the traced region is redrawn from the PDF at
+  1400 px, so a callout six pixels tall on the full sheet is legible.
+* Every located value is boxed and coloured by provenance; values with no
+  single place on the sheet are listed and marked as such.
+* A row traces to its box (`tests/test_workspace.py::TestTheDrawingViewer`);
+  the numbers match the workbook (`tests/test_viewer.py::TestNumbering`).
+* The syntax-tree guards still pass — no page runs the model, no view calls
+  `st.stop()` — and a full run still changes none of the real files.
 
 ---
 

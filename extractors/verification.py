@@ -130,8 +130,16 @@ def build_check_print(page: fitz.Page, result: ExtractionResult, *,
     font = _load_font(int(W / 120))
     small = _load_font(int(W / 170))
 
-    items = [i for i in collect_items(result, grid) if i.rect_norm]
-    for n, item in enumerate(items, start=1):
+    # Numbered by position in `collect_items`, which is how `verification_rows`
+    # numbers the workbook's Verification sheet and how the app's evidence table
+    # numbers its rows. Numbering only the boxed ones — as this did — made box
+    # "1." on the print row #6 in the sheet, so the two artefacts a checker
+    # holds side by side disagreed about which value was which.
+    all_items = collect_items(result, grid)
+    items = [i for i in all_items if i.rect_norm]
+    for n, item in enumerate(all_items, start=1):
+        if not item.rect_norm:
+            continue
         colour = _CONF_COLOUR.get(item.confidence, COLOUR_MEDIUM)
         x0, y0, x1, y1 = item.rect_norm
         box = [x0 * W - 6, y0 * H - 6, x1 * W + 6, y1 * H + 6]
